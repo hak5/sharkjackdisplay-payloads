@@ -25,18 +25,21 @@ show_settings() {
 source /usr/lib/list_tools
 initialize_menu() {
   ADD_MENU_ITEM "Start Scan" "execute_scan"
-  ADD_MENU_ITEM "Scan Settings" "menu_settings"
-  ADD_MENU_ITEM "Profile" "render_menu_profile"
+  ADD_MENU_ITEM "Pick Profile" "render_menu_profile"
+  ADD_MENU_ITEM "Set Options" "menu_settings"
+  ADD_MENU_ITEM "Show Options" "show_settings"
   ADD_MENU_ITEM "Quit Payload" "EXIT_MENU"
 
-  ADD_SUBMENU_ITEM "menu_settings" "NETMODE" "set_netmode"
   ADD_SUBMENU_ITEM "menu_settings" "Target" "set_target"
   ADD_SUBMENU_ITEM "menu_settings" "Scan Type" "set_scan_type"
-  ADD_SUBMENU_ITEM "menu_settings" "Max Retries" "set_max_retries"
-  ADD_SUBMENU_ITEM "menu_settings" "Host Timeout" "set_host_timeout"
-  ADD_SUBMENU_ITEM "menu_settings" "Show Settings" "show_settings"
-  ADD_SUBMENU_ITEM "menu_settings" "Save as Profile" "menu_save_profile"
+  ADD_SUBMENU_ITEM "menu_settings" "Advanced" "menu_settings_advanced"
+  ADD_SUBMENU_ITEM "menu_settings" "Save Profile" "menu_save_profile"
   ADD_SUBMENU_ITEM "menu_settings" "← Back"
+
+  ADD_SUBMENU_ITEM "menu_settings_advanced" "NETMODE" "set_netmode"
+  ADD_SUBMENU_ITEM "menu_settings_advanced" "Max Retries" "set_max_retries"
+  ADD_SUBMENU_ITEM "menu_settings_advanced" "Host Timeout" "set_host_timeout"
+  ADD_SUBMENU_ITEM "menu_settings_advanced" "← Back"
 
   ADD_SUBMENU_ITEM "menu_save_profile" "Save Default" "save_as_default_profile"
   ADD_SUBMENU_ITEM "menu_save_profile" "Save As..." "save_as_new_profile"
@@ -95,38 +98,66 @@ set_netmode() {
 }
 
 set_target() {
-  SCAN_TARGET="$(LIST_PICKER "Target" "Entire_Subnet Specific_IP" "Entire_Subnet")"
-  case "$SCAN_TARGET" in
-    "Entire_Subnet")
+  TARGET_PICK="$(OPTION_DIALOG "Target" "Subnet" "IP_Addr")"
+  # TARGET_PICK="$(LIST_PICKER "Target" "Entire_Subnet Specific_IP" "Entire_Subnet")"
+  case "$TARGET_PICK" in
+    "Subnet")
       SCAN_TARGET="SUBNET"
     ;;
-    "Specific_IP")
+    "IP_Addr")
       RESP="$(IP_PICKER "IP Address" "192.168.1.100")"
       if [ "$RESP" != "← Back" ]; then
         SCAN_TARGET="$RESP"
+      else
+        # TODO figure out why this doesn't set
+        SCAN_TARGET="SUBNET"
       fi
     ;;
   esac
 }
 
 set_scan_type() {
-  SCAN_TYPE="$(LIST_PICKER "Scan Type" "List Discovery Ping Port Service" "Ping")"
-  case "$SCAN_TYPE" in
-    "List") NMAP_SCAN="-sL" ;;
-    "Discovery") NMAP_SCAN="-sn" ;;
-    "Ping") NMAP_SCAN="-sP" ;;
-    "Port") set_port_scan ;;
-    "Service") NMAP_SCAN="-sV" 
-      SVC_SPEED="$(OPTION_DIALOG "Service/Version Scan Speed" "Fast" "Slow")"
-        case "$SVC_SPEED" in
+#  SCAN_TYPE="$(LIST_PICKER "Scan Type" "List Discovery Ping Port Service" "Ping")"
+#  case "$SCAN_TYPE" in
+#    "List") NMAP_SCAN="-sL" ;;
+#    "Discovery") NMAP_SCAN="-sn" ;;
+#    "Ping") NMAP_SCAN="-sP" ;;
+#    "Port") set_port_scan ;;
+#    "Service") NMAP_SCAN="-sV" 
+#      SVC_SPEED="$(OPTION_DIALOG "Service/Version Scan Speed" "Fast" "Slow")"
+#        case "$SVC_SPEED" in
+#          "Fast") NMAP_SCAN="-sV -version-light" ;;
+#          "Slow") NMAP_SCAN="-sV" ;;
+#        esac
+#    ;;
+#    "← Back") ;;
+#    *)
+#      ALERT "Scan Type Error" 5 && exit;;
+#  esac
+
+case "$SCAN_TARGET" in
+  "SUBNET"|*/*)
+    RESP="$(OPTION_DIALOG "Subnet Scan" "Passive" "Ping")"
+    case "$RESP" in
+      "Passive") NMAP_SCAN="-sL" ;;
+      "Ping") NMAP_SCAN="-sn" ;;
+      *) ALERT "Subnet Scan Error" 5 && exit ;;
+    esac
+  ;;
+  [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+    RESP="$(OPTION_DIALOG "IP Scan" "Port" "Service")"
+    case "$RESP" in
+      "Port") set_port_scan ;;
+      "Service") 
+        RESP="$(OPTION_DIALOG "Service/Version Scan Speed" "Fast" "Slow")"
+        case "RESP" in
           "Fast") NMAP_SCAN="-sV -version-light" ;;
           "Slow") NMAP_SCAN="-sV" ;;
         esac
-    ;;
-    "← Back") ;;
-    *)
-      ALERT "Scan Type Error" 5 && exit;;
-  esac
+      ;;
+    esac
+  ;;
+esac
 }
 
 set_port_scan() {
@@ -307,9 +338,13 @@ results_alert() {
           ALERT "Scan $COUNT Done. \n$HOSTS_SCANNED Scanned" -1 false
         ;;
         *)
-          PORTS_FOUND="$(cat "$LOOT_DIR/scan-$COUNT.txt" | grep tcp | grep open | wc -l)"
-          ALERT "Scan $COUNT Done. \nPorts open $PORTS_FOUND" 2
-          ALERT "Scan $COUNT Done. \nPorts open $PORTS_FOUND" -1 false
+          PORTS_FOUND="$(cat "$LOOT_DIR/scan-$COUNT.txt" | grep "/" | grep -v -e "Not shown" -e "Starting Nmap" | wc -l)"
+          ALERT "Scan $COUNT Done. \nPorts seen $PORTS_FOUND" 2
+          ALERT "Scan $COUNT Done. \nPorts seen $PORTS_FOUND" -1 false
+          RESP="$(OPTION_DIALOG "View Results?" " Yes " " No ")"
+          if [ "$RESP" = " Yes " ]; then
+            show_results_ports
+          fi
         ;;
       esac
     ;;
@@ -322,9 +357,13 @@ results_alert() {
           ALERT "Scan $COUNT Done. \n$HOSTS_SCANNED Scanned" -1 false
         ;;
         *)
-          PORTS_FOUND="$(cat "$LOOT_DIR/scan-$COUNT.txt" | grep tcp | grep open | wc -l)"
-          ALERT "Scan $COUNT Done. \nPorts open $PORTS_FOUND" 2
-          ALERT "Scan $COUNT Done. \nPorts open $PORTS_FOUND" -1 false
+          PORTS_FOUND="$(cat "$LOOT_DIR/scan-$COUNT.txt" | grep "/" | grep -v -e "Not shown" -e "Starting Nmap" | wc -l)"
+          ALERT "Scan $COUNT Done. \nPorts seen $PORTS_FOUND" 2
+          ALERT "Scan $COUNT Done. \nPorts seen $PORTS_FOUND" -1 false
+          RESP="$(OPTION_DIALOG "View Results?" " Yes " " No ")"
+          if [ "$RESP" = " Yes " ]; then
+            show_results_ports
+          fi
         ;;
       esac
     ;;
@@ -336,7 +375,29 @@ results_alert() {
 
 }
 
+show_results_ports() {
+  CLEAR_MENU "results"
+  source /usr/lib/spinner_tools
+  CREATE_SPINNER "Loading..."
+  RESULTS="$(cat $LOOT_DIR/scan-$COUNT.txt | grep -e "tcp" -e "udp" | grep -v -e "Not shown" -e "Starting Nmap")"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+
+      port="$(echo "$line" | awk {'print $1'})"
+      state="$(echo "$line" | awk {'print $2'})"
+      service="$(echo "$line" | awk '{for (i=3; i<=NF; i++) printf "%s%s", $i, (i<NF ? " " : "\n")}')"
+
+      ADD_SUBMENU_ITEM "results" "$port $state" "results_menu_${port}"
+      ADD_SUBMENU_ITEM "results_menu_${port}" "$service" "noop"
+      ADD_SUBMENU_ITEM "results_menu_${port}" "Back" "Back"
+    done <<< "$RESULTS"
+    ADD_SUBMENU_ITEM "results" "Back" "Back"
+    STOP_SPINNER
+    SELECT_MENU results
+}
+
 show_results_list() {
+  CLEAR_MENU "results"
   source /usr/lib/spinner_tools
   CREATE_SPINNER "Loading..."
   RESULTS="$(cat $LOOT_DIR/scan-$COUNT.txt | grep "Nmap scan report for" | grep '(')"
@@ -355,6 +416,7 @@ show_results_list() {
 }
 
 show_results_ping() {
+  CLEAR_MENU "results"
   source /usr/lib/spinner_tools
   CREATE_SPINNER "Loading..."
   RESULTS="$(cat $LOOT_DIR/scan-$COUNT.txt | grep "Nmap scan report for" | grep '(')"
