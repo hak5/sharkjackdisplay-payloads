@@ -336,22 +336,32 @@ results_alert() {
 }
 
 show_results_list() {
-  #RESULTS="$(cat $LOOT_DIR/scan-$COUNT.txt | grep "Nmap scan report for" | grep '(')"
-  #while IFS= read -r line; do
-  grep "Nmap scan report for" "$LOOT_DIR/scan-$COUNT.txt" | grep "(" | while IFS= read -r line; do
-    # Skip empty lines
-    [[ -z "$line" ]] && continue
-    # Extract the hostname (between "Nmap scan report for " and the first space)
-    # TODO duplicate and blank host names
-    hostname="$(echo "$line" | grep "Nmap scan report for" | grep "(" | awk {'print $5'})"
-    # Extract the IP address from inside parentheses
-    ip="$(echo "$line" | grep "Nmap scan report for" | grep "(" | awk {'print $6'} | sed 's/(//' | sed 's/)//')"
-    # Call the existing ADD_SUBMENU_ITEM function
-    ADD_SUBMENU_ITEM "results" "$ip" "results_menu_${ip}"
-    ADD_SUBMENU_ITEM "results_menu_${ip}" "$hostname" "noop"
-  done
-  ADD_SUBMENU_ITEM "Quit Results" "Back"
-  SELECT_MENU results
+  RESULTS="$(cat $LOOT_DIR/scan-$COUNT.txt | grep "Nmap scan report for" | grep '(')"
+    while IFS= read -r line; do
+      # Skip empty lines
+      [[ -z "$line" ]] && continue
+      # Extract the hostname (between "Nmap scan report for " and the first space)
+      # TODO duplicate and blank host names
+      hostname="$(echo "$line" | grep "Nmap scan report for" | grep "(" | awk '{gsub(/\.lan$/, "", $5); print $5}')"
+      # Extract the IP address from inside parentheses
+      ip="$(echo "$line" | grep "Nmap scan report for" | grep "(" | awk {'print $6'} | sed 's/(//' | sed 's/)//')"
+      # Call the existing ADD_SUBMENU_ITEM function
+      logger -t "nmap-payload" "ADD_SUBMENU_ITEM results $ip results_menu_${ip}"
+      ADD_SUBMENU_ITEM "results" "$ip $hostname" "results_menu_${ip}"
+      logger -t "nmap-payload" "ADD_SUBMENU_ITEM results_menu_${ip} $hostname noop"
+      ADD_SUBMENU_ITEM "results_menu_${ip}" "$hostname" "noop"
+      ADD_SUBMENU_ITEM "results_menu_${ip}" "Set Target" "set_new_target" "${ip}"
+      ADD_SUBMENU_ITEM "results_menu_${ip}" "Back" "Back"
+    done <<< "$RESULTS"
+    ADD_SUBMENU_ITEM "results" "Back" "Back"
+    SELECT_MENU results
+}
+
+set_new_target() {
+  NEW_TARGET=$SELECTED_ITEM_DATA
+  ALERT "New Target: $NEW_TARGET" -1 false
+  EXIT_MENU
+  START_MENU
 }
 
 
