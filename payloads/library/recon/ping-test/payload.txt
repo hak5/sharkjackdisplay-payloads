@@ -17,7 +17,7 @@ get_config_options(){
   PING_NUM="$(GET_PAYLOAD_CONFIG_OPTION PING_NUM "4" $PROFILE)"
   LED_SUCCESS="$(GET_PAYLOAD_CONFIG_OPTION LED_SUCCESS "G" $PROFILE)"
   LED_FAIL="$(GET_PAYLOAD_CONFIG_OPTION LED_FAIL "R" $PROFILE)"
-#  LOOP_TEST="$(GET_PAYLOAD_CONFIG_OPTION LOOP_TEST "FALSE" $PROFILE)"
+  #LOOP_TEST="$(GET_PAYLOAD_CONFIG_OPTION LOOP_TEST "FALSE" $PROFILE)"
   PING_NETMODE="$(GET_PAYLOAD_CONFIG_OPTION PING_NETMODE "DHCP_CLIENT" $PROFILE)"
   STATIC_ARGUMENTS="$(GET_PAYLOAD_CONFIG_OPTION STATIC_ARGUMENTS "" $PROFILE)"
 
@@ -54,7 +54,7 @@ initialize_menu() {
   ADD_SUBMENU_ITEM "menu_options_advanced" "Success Color" "set_success_led"
   ADD_SUBMENU_ITEM "menu_options_advanced" "Fail Color" "set_fail_led"
   ADD_SUBMENU_ITEM "menu_options_advanced" "NETMODE" "set_netmode"
-#  ADD_SUBMENU_ITEM "menu_options_advanced" "Continuous Test" "set_continuous"
+  #ADD_SUBMENU_ITEM "menu_options_advanced" "Continuous Test" "set_continuous"
   ADD_SUBMENU_ITEM "menu_options_advanced" "← Back"
 
   ADD_SUBMENU_ITEM "menu_save_profile" "Save Default" "save_as_default_profile"
@@ -65,13 +65,18 @@ initialize_menu() {
 render_menu_profile(){
   logger -t "ping-payload" "render_menu_profile"
   RESP="$(PAYLOAD_CONFIG_MENU)"
-  if [ "$RESP" = "← Back" ]; then
-    return
-  fi
-  PROFILE="$RESP"
-  logger -t "ping-payload" "Loaded profile: $PROFILE"
-  get_config_options
-  show_options
+  logger -t "ping-payload" "PAYLOAD_CONFIG_MENU response: $RESP"
+  case "$RESP" in
+    "") # TODO update to ← Back in FW update
+      ALERT "Canceled" 1 false
+    ;;
+    *)
+      PROFILE="$RESP"
+      logger -t "ping-payload" "Loaded profile: $PROFILE"
+      get_config_options
+      show_options
+    ;;
+  esac
 }
 
 show_options(){
@@ -119,30 +124,33 @@ save_as_default_profile(){
   PING_NUM="$(SET_PAYLOAD_CONFIG_OPTION PING_NUM "$PING_NUM" $PROFILE)"
   LED_SUCCESS="$(SET_PAYLOAD_CONFIG_OPTION LED_SUCCESS "$LED_SUCCESS" $PROFILE)"
   LED_FAIL="$(SET_PAYLOAD_CONFIG_OPTION LED_FAIL "$LED_FAIL" $PROFILE)"
-#  LOOP_TEST="$(SET_PAYLOAD_CONFIG_OPTION LOOP_TEST "$LOOP_TEST" $PROFILE)"
+  #LOOP_TEST="$(SET_PAYLOAD_CONFIG_OPTION LOOP_TEST "$LOOP_TEST" $PROFILE)"
   PING_NETMODE="$(SET_PAYLOAD_CONFIG_OPTION PING_NETMODE "$PING_NETMODE" $PROFILE)"
   STATIC_ARGUMENTS="$(SET_PAYLOAD_CONFIG_OPTION STATIC_ARGUMENTS "$STATIC_ARGUMENTS" $PROFILE)"
-  ALERT "Default Profile Saved" 3 false
+  ALERT "Default Profile Saved" 1 false
   get_config_options
 }
 
 save_as_new_profile(){
   logger -t "ping-payload" "save_as_new_profile"
   RESP="$(TEXT_PICKER "Profile Name" "profile01" "abcdefghijklmnopqrstuvwxyz_0123456789")"
-  if [ "$RESP" = "← Back" ]; then
-    ALERT "Cancelled" 2 false
-    return
-  fi
-  PROFILE="${RESP}.cfg"
-  PING_HOST="$(SET_PAYLOAD_CONFIG_OPTION PING_HOST "$PING_HOST" $PROFILE)"
-  PING_NUM="$(SET_PAYLOAD_CONFIG_OPTION PING_NUM "$PING_NUM" $PROFILE)"
-  LED_SUCCESS="$(SET_PAYLOAD_CONFIG_OPTION LED_SUCCESS "$LED_SUCCESS" $PROFILE)"
-  LED_FAIL="$(SET_PAYLOAD_CONFIG_OPTION LED_FAIL "$LED_FAIL" $PROFILE)"
-#  LOOP_TEST="$(SET_PAYLOAD_CONFIG_OPTION LOOP_TEST "$LOOP_TEST" $PROFILE)"
-  PING_NETMODE="$(SET_PAYLOAD_CONFIG_OPTION PING_NETMODE "$PING_NETMODE" $PROFILE)"
-  STATIC_ARGUMENTS="$(SET_PAYLOAD_CONFIG_OPTION STATIC_ARGUMENTS "$STATIC_ARGUMENTS" $PROFILE)"
-  ALERT "Profile: $PROFILE Saved" 3 false
-  get_config_options
+  case "$RESP" in
+    "← Back")
+      ALERT "Canceled" 1 false
+    ;;
+    *)
+      PROFILE="${RESP}.cfg"
+      PING_HOST="$(SET_PAYLOAD_CONFIG_OPTION PING_HOST "$PING_HOST" $PROFILE)"
+      PING_NUM="$(SET_PAYLOAD_CONFIG_OPTION PING_NUM "$PING_NUM" $PROFILE)"
+      LED_SUCCESS="$(SET_PAYLOAD_CONFIG_OPTION LED_SUCCESS "$LED_SUCCESS" $PROFILE)"
+      LED_FAIL="$(SET_PAYLOAD_CONFIG_OPTION LED_FAIL "$LED_FAIL" $PROFILE)"
+      #LOOP_TEST="$(SET_PAYLOAD_CONFIG_OPTION LOOP_TEST "$LOOP_TEST" $PROFILE)"
+      PING_NETMODE="$(SET_PAYLOAD_CONFIG_OPTION PING_NETMODE "$PING_NETMODE" $PROFILE)"
+      STATIC_ARGUMENTS="$(SET_PAYLOAD_CONFIG_OPTION STATIC_ARGUMENTS "$STATIC_ARGUMENTS" $PROFILE)"
+      ALERT "Profile: $PROFILE Saved" 1 false
+      get_config_options
+    ;;
+  esac
 }
 
 set_host(){
@@ -163,9 +171,9 @@ set_host_ip(){
   RESP="$(IP_PICKER "IP Address" "001.001.001.001")"
   logger -t "ping-payload" "$RESP"
   case "$RESP" in
-    "")
+    "") # TODO update to ← Back in FW update
       logger -t "ping-payload" "Back from set_host_ip"
-      ALERT "Host not set" 2 false
+      ALERT "Host not set" 1 false
     ;;
     *)
       PING_HOST="$RESP"
@@ -180,7 +188,7 @@ set_host_name(){
   case "$RESP" in
     "← Back")
       logger -t "ping-payload" "Back from set_host_name"
-      ALERT "Host not set" 2 false
+      ALERT "Host not set" 1 false
     ;;
     *)
       PING_HOST="$RESP"
@@ -192,11 +200,17 @@ set_ping_num(){
   logger -t "ping-payload" "set_ping_name"
   RESP="$(SINGLE_NUMBER_PICKER "Number of pings" "4")"
   logger -t "ping-payload" "$RESP"
-  if [ "$RESP" = "0" ]; then
-    ALERT "Number must be 1 or greater" 3 false
-    set_ping_num
-  fi
-  PING_NUM=$RESP
+  case "$RESP" in
+    "0") 
+      ALERT "Count must be greater than 0" 2 false
+    ;;
+    "← Back")
+      ALERT "Count not set" 1 false
+    ;;
+    *)
+      PING_NUM=$RESP
+    ;;
+  esac
 }
 
 set_success_led(){
@@ -204,7 +218,7 @@ set_success_led(){
   RESP="$(LIST_PICKER "Success LED" "Green Blue Red Yellow Magenta White" "Green")"
   logger -t "ping-payload" "$RESP"
   case "$RESP" in
-    "← Back") ALERT "LED not set" 2 false 
+    "← Back") ALERT "LED not set" 1 false 
       logger -t "ping-payload" "Back from set_success_led"
     ;;
     "Green")   LED_SUCCESS="G" ;;
@@ -221,7 +235,7 @@ set_fail_led(){
   RESP="$(LIST_PICKER "Failure LED" "Red Green Blue Yellow Magenta White" "Red")"
   logger -t "ping-payload" "$RESP"
   case "$RESP" in
-    "← Back") ALERT "LED not set" 2 false 
+    "← Back") ALERT "LED not set" 1 false 
       logger -t "ping-payload" "Back from set_fail_led"
     ;;
     "Green")   LED_FAIL="G" ;;
@@ -249,8 +263,8 @@ set_netmode() {
       RESP="$(CREATE_NETMODE_ARGUMENTS "192.168.1.100" "255.255.255.0" "192.168.1.1")"
       logger -t "ping-payload" "CREATE_NETMODE_ARGUMENTS $RESP"
       case "$RESP" in
-        "")
-          ALERT "NETMODE not set" 2 false
+        "") # TODO update to ← Back in FW update
+          ALERT "NETMODE not set" 1 false
         ;;
         *) 
           PING_NETMODE="STATIC"
@@ -262,7 +276,7 @@ set_netmode() {
     ;;
     "Back")
       logger -t "ping-payload" "Back from set_netmode"
-      ALERT "NETMODE not set" 2 false
+      ALERT "NETMODE not set" 1 false
     ;;
   esac
 }
