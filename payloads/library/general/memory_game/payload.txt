@@ -69,11 +69,11 @@ while true; do
   ALERT "$TAUNT\n Round $ROUND" 1 false
   LED OFF
   ALERT "3.." 0 false
-  sleep 0.2
+  sleep 0.125
   ALERT ".2." 0 false
-  sleep 0.2
+  sleep 0.125
   ALERT "..1" 0 false
-  sleep 0.2
+  sleep 0.125
 
   # Generate pattern of $length random arrows
   pattern=()
@@ -83,7 +83,10 @@ while true; do
   done
 
   # Show pattern for $delay seconds
-  ALERT "$(printf "%s" "${pattern[@]}")" "$delay" false
+  ALERT "$(printf "%s" "${pattern[@]}")" "$((delay -1))" false
+  ALERT "$(printf "%s" "${pattern[@]}")" 1 true
+  ALERT "Go!" 0 false
+  sleep 0.3
   CLEAR_SCREEN
 
   # Map input back to arrows
@@ -121,6 +124,7 @@ while true; do
   else
     LED FAIL
     ALERT "Game Over!\n Score: $((ROUND - 1))" -1 false
+    ALERT "Game Over!\n Score: $((ROUND - 1)) \n Press ←" -1 false
     RESP="$(OPTION_DIALOG "Play again?" " Yes " " No ")"
     case "$RESP" in
       " Yes ") ROUND=1 ;;
