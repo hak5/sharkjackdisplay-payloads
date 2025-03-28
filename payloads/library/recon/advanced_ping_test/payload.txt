@@ -4,10 +4,12 @@
 # Props: Korben
 # Description: Test pings to configurable host with logging and profile support.
 
-PROFILE="payload.cfg"
-LOOT_DIR="/root/loot/ping"
-LED SETUP
-mkdir -p $LOOT_DIR
+setup_payload(){
+  PROFILE="default.cfg"
+  LOOT_DIR="/root/loot/ping"
+  LED SETUP
+  mkdir -p $LOOT_DIR
+}
 
 get_config_options(){
   PING_HOST="$(GET_PAYLOAD_CONFIG_OPTION PING_HOST "8.8.8.8" $PROFILE)"
@@ -97,7 +99,7 @@ show_options(){
 }
 
 save_as_default_profile(){
-  PROFILE="payload.cfg"
+  PROFILE="default.cfg"
   PING_HOST="$(SET_PAYLOAD_CONFIG_OPTION PING_HOST "$PING_HOST" $PROFILE)"
   PING_NUM="$(SET_PAYLOAD_CONFIG_OPTION PING_NUM "$PING_NUM" $PROFILE)"
   LED_SUCCESS="$(SET_PAYLOAD_CONFIG_OPTION LED_SUCCESS "$LED_SUCCESS" $PROFILE)"
@@ -307,8 +309,16 @@ show_results(){
   SCREEN_WRITE "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀"
 }
 
+setup_payload
 get_config_options
 initialize_menu
 # 1337 ANSI art
-ALERT "                  ▐▀▌▐ ▌ ▐  ▄▄    ▐ ▌▐ █ ▐ ▐  ▀   ▐▄▌▐ ▌▌▐ ▌ ▄▄   ▐  ▐ ▌▐▐ ▐  ▐   ▐  ▐ ▌ █  ▀▄▀ " 1 false true
+ALERT "\
+                \
+  ▐▀▌▐ ▌ ▐  ▄▄  \
+  ▐ ▌▐ █ ▐ ▐  ▀ \
+  ▐▄▌▐ ▌▌▐ ▌ ▄▄ \
+  ▐  ▐ ▌▐▐ ▐  ▐ \
+  ▐  ▐ ▌ █  ▀▄▀ \
+" 1 false true
 START_MENU
