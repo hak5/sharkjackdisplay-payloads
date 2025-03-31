@@ -1,8 +1,8 @@
 #!/bin/bash
 
-source /usr/lib/progress_bar_tools
-
 SCREEN_WRITE "loading"
+
+sleep 1
 
 # Create progress bar with title "Loading..."
 CREATE_PROGRESS_BAR "Loading..."
@@ -13,6 +13,7 @@ sleep 1
 INCREMENT_PROGRESS 10
 
 sleep 1
+
 INCREMENT_PROGRESS 10
 
 sleep 1

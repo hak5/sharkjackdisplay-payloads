@@ -16,19 +16,23 @@ SCREEN_WRITE "Alert Demo!"
 
 SCREEN_WRITE "Flashing"
 
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
+
 # This will display a flashing alert titled "Flashing!" for 2 seconds unless user presses button to exit early
 # the title will automatically be centered horizontally and vertically
 ALERT "Flashing!" 3
 
 SCREEN_WRITE "Done"
 
-sleep 1
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
 
 ########################################################
 # Solid Alert
 ################################################################################
 
 SCREEN_WRITE "Solid"
+
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
 
 # This will display a solid alert titled "Solid" for 1 second unless user presses button to exit early
 # the title will automatically be centered horizontally and vertically
@@ -44,6 +48,8 @@ sleep 1
 
 SCREEN_WRITE "Raw Title"
 
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
+
 # This will display a solid alert titled "Raw Format!" for 1 second unless user presses button to exit early
 # the title will not be automatically formatted by the ALERT command, allowing the caller to format as desired
 ALERT "Raw Format!" 3 false true
@@ -58,6 +64,8 @@ sleep 1
 
 SCREEN_WRITE "Formatting"
 
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
+
 # This will display a solid alert titled "Raw Format!" for 1 second unless user presses button to exit early
 ALERT "$(center_text "Manual")\n\n$(center_text "Format!")" 3 false true
 SCREEN_WRITE "Done"
@@ -65,12 +73,13 @@ SCREEN_WRITE "Done"
 sleep 1
 
 
-
 ########################################################
 # No Timeout Solid Alert
 ################################################################################
 
 SCREEN_WRITE "No timeout!"
+
+sleep 1 # give SCREEN_WRITE a chance to render before drawing alert over it
 
 # This will display a solid alert titled "Press button to exit!" for 1 second unless user presses button to exit early
 # the title will not be automatically formatted by the ALERT command, allowing the caller to format as desired

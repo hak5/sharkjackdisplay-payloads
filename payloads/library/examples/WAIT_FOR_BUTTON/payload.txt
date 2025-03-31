@@ -1,6 +1,5 @@
 #!/bin/bash
 
-
 SCREEN_WRITE "Wait for up"
 
 WAIT_FOR_BUTTON_UP
@@ -9,7 +8,6 @@ WAIT_FOR_BUTTON_UP
 SCREEN_WRITE "Done"
 
 sleep 1
-
 
 
 SCREEN_WRITE "Wait for down"
@@ -22,7 +20,6 @@ SCREEN_WRITE "Done"
 sleep 1
 
 
-
 SCREEN_WRITE "Wait for middle"
 
 WAIT_FOR_BUTTON_MIDDLE
@@ -33,7 +30,6 @@ SCREEN_WRITE "Done"
 sleep 1
 
 
-
 SCREEN_WRITE "Wait for ANY"
 
 resp="$(WAIT_FOR_INPUT)"
@@ -41,5 +37,3 @@ resp="$(WAIT_FOR_INPUT)"
 SCREEN_WRITE "$resp"
 
 SCREEN_WRITE "Done"
-
-sleep 1

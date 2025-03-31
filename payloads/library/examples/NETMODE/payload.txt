@@ -1,7 +1,5 @@
 #!/bin/bash
 
-source /usr/lib/spinner_tools
-
 # By default, all netmode commands without explicit arguments
 # will use the configuration defined in config.txt for IP, SUBNET, GATEWAY
 

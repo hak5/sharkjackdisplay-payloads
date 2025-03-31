@@ -1,3 +1,15 @@
 #!/bin/bash
 
+# Use GET_PAYLOAD_CONFIG_OPTION to fetch a config option from a payload .cfg file, or fall back to a default if none found
+
+# Usage:
+# GET_PAYLOAD_CONFIG_OPTION "THEME" <default value if none found>
+
+PROFILE="default.cfg"
+
+# Get the NMAP_SCAN config option from default.cfg, if one does not exist, "-sL" will be used
+NMAP_SCAN="$(GET_PAYLOAD_CONFIG_OPTION NMAP_SCAN "-sL" $PROFILE)"
+# Get the HOST_TIMEOUT config option from default.cfg, if one does not exist, "30s" will be used
+HOST_TIMEOUT="$(GET_PAYLOAD_CONFIG_OPTION HOST_TIMEOUT "30s" $PROFILE)"
+
 

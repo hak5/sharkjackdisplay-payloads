@@ -6,6 +6,9 @@
 # provided your code handles trimming the string afterwards
 
 SCREEN_WRITE "default"
+
+sleep 1
+
 # text picker with default (full) alphabet
 resp="$(TEXT_PICKER "Name" "dade")"
 if [ "$resp" = "← Back" ]; then
@@ -14,10 +17,13 @@ else
   SCREEN_WRITE "Hello, $resp"
 fi
 
-SCREEN_WRITE "done"
-sleep 2
+sleep 1
+
 
 SCREEN_WRITE "custom alphabet"
+
+sleep 1
+
 # text picker with custom alphabet
 resp="$(TEXT_PICKER "Fav MAC" "deadbeefcafe" "0123456789abcdef")"
 if [ "$resp" = "← Back" ]; then
@@ -27,10 +33,12 @@ else
   SCREEN_WRITE "Nice!"
 fi
 
-SCREEN_WRITE "done"
-sleep 2
+sleep 1
 
 SCREEN_WRITE "full width"
+
+sleep 1
+
 # text picker with "dynamic width"
 resp="$(TEXT_PICKER "Password" "     Hunter2     ")"
 if [ "$resp" = "← Back" ]; then
@@ -39,4 +47,4 @@ else
   SCREEN_WRITE "$resp"
 fi
 
-SCREEN_WRITE "done"
+SCREEN_WRITE "Done"

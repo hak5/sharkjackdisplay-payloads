@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# Write to the scrollable payload log WITHOUT bringing it into focus
+
+# add to log but dont bring log into focus
+LOG "Test 1"
+sleep 0.5
+LOG "Test 2"
+sleep 0.5
+LOG "Test 3"
+sleep 0.5
+LOG "Test 4"
+sleep 0.5
+# write to log AND bring log into focus
+SCREEN_WRITE "Test 5"
+sleep 0.5
+LOG "Test 6"
+sleep 0.5
+LOG "Test 7"
+sleep 0.5
+LOG "Test 8"
+sleep 0.5
+LOG "Test 9"
+sleep 0.5
+# write to log AND bring log into focus
+SCREEN_WRITE "Test 10"

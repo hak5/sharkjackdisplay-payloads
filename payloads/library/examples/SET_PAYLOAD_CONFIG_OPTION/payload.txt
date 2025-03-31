@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# SET_PAYLOAD_CONFIG_OPTION  can be used to set values within a payload .cfg file
+# by default it will be default.cfg within the payload directory of the payload executing this
+
+# Usage
+# SET_PAYLOAD_CONFIG_OPTION "TEST" "3"
+
+# Specific profile usage
+# SET_PAYLOAD_CONFIG_OPTION "TEST" "3" "custom.cfg"
+
+
+
+# Example "new" / non-default values - that would normally be set by having user change settings from within a list_tools menu...
+NMAP_SCAN="-sP"
+HOST_TIMEOUT="60s"
+
+# Prompt user to name the .cfg file
+RESP="$(TEXT_PICKER "Profile Name" "profile01" "abcdefghijklmnopqrstuvwxyz_0123456789")"
+if [ "$RESP" = "← Back" ]; then
+  ALERT "Cancelled" 2 false
+  return
+fi
+
+# Define the profile name
+PROFILE="${RESP}.cfg"
+# Save the NMAP_SCAN option within new profile
+SET_PAYLOAD_CONFIG_OPTION NMAP_SCAN "$NMAP_SCAN" $PROFILE
+# Save the HOST_TIMEOUT option within new profile
+SET_PAYLOAD_CONFIG_OPTION HOST_TIMEOUT "$HOST_TIMEOUT" $PROFILE
+
+# Show the user the operation is complete
+ALERT "Profile: $PROFILE Saved" 3 false

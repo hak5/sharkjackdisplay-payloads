@@ -1,11 +1,15 @@
 #!/bin/bash
 
+# Display a cancellable countdown to the user.
+# Press button to cancel, or let it timeout
+
 resp="$(COUNTDOWN "COUNTDOWN" 10)"
 if [ "$resp" = "Cancelled" ]; then
-  SCREEN_WRITE "Finished!"
-  ALERT "Cancelled" 2 false
-else
+  ALERT "$resp" 2 false
   SCREEN_WRITE "Cancelled!"
-  ALERT "Cancelled" 2 false
+else
+  # $resp will be "Timeout"
+  ALERT "$resp" 2 false
+  SCREEN_WRITE "Timeout!"
 fi
 

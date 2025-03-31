@@ -1,5 +1,9 @@
 #!/bin/bash
 
+SCREEN_WRITE "Getting NETMODE"
+
 resp="$(GET_NETMODE)"
 
 SCREEN_WRITE "$resp"
+
+SCREEN_WRITE "Done"

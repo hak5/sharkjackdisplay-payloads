@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Below is an example of a list menu and how one might use it in a payloa
-source /usr/lib/list_tools
+# Below is an example of a list menu and how one might use it in a payload
 
 # Available list_tools functions:
 # ADD_MENU_ITEM <item/title> <function name OR submenu name> (optional)<data>
