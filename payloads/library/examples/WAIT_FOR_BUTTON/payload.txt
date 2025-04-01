@@ -1,6 +1,7 @@
 #!/bin/bash
 
 SCREEN_WRITE "Wait for up"
+sleep 1
 
 WAIT_FOR_BUTTON_UP
 # WAIT_FOR_BUTTON_RIGHT
@@ -11,6 +12,7 @@ sleep 1
 
 
 SCREEN_WRITE "Wait for down"
+sleep 1
 
 WAIT_FOR_BUTTON_DOWN
 # WAIT_FOR_BUTTON_LEFT
@@ -21,6 +23,7 @@ sleep 1
 
 
 SCREEN_WRITE "Wait for middle"
+sleep 1
 
 WAIT_FOR_BUTTON_MIDDLE
 # WAIT_FOR_BUTTON
@@ -31,9 +34,14 @@ sleep 1
 
 
 SCREEN_WRITE "Wait for ANY"
+sleep 1
+
+# Using 0 seconds for the timeout means alert will not consume the button input
+ALERT "press ANY to continue" 0 false
 
 resp="$(WAIT_FOR_INPUT)"
 
 SCREEN_WRITE "$resp"
 
 SCREEN_WRITE "Done"
+

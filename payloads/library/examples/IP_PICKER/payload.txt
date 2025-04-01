@@ -4,7 +4,7 @@ source /usr/lib/shark_ip_helpers
 
 RESP="$(IP_PICKER "IP Address" "192.168.1.100")"
 if [ "$RESP" != "← Back" ]; then
-  SCREEN_WRITE "Cancelled"
-else
   SCREEN_WRITE "$RESP"
+else
+  SCREEN_WRITE "Cancelled"
 fi

@@ -28,4 +28,6 @@ SET_PROGRESS 90
 sleep 0.5
 SET_PROGRESS 100
 
+sleep 1
+
 SCREEN_WRITE "Complete"

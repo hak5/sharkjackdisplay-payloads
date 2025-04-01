@@ -3,6 +3,9 @@
 # The number picker can be used to pick fixed width numbers and will skip special characters
 
 SCREEN_WRITE "Opening Picker"
+
+sleep 1
+
 CODE="$(NUMBER_PICKER "Pairing Code" "1-2-3-4")"
 if [ "$CODE" = "← Back" ]; then
   SCREEN_WRITE "Cancelled"

@@ -8,6 +8,8 @@
 
 SCREEN_WRITE "Prompting"
 
+sleep 1
+
 resp="$(SINGLE_NUMBER_PICKER "Subnet" "/9")"
 if [ "$resp" = "← Back" ]; then
   SCREEN_WRITE "Cancelled"

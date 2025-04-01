@@ -5,52 +5,64 @@
 
 # Enter DHCP Client mode
 SCREEN_WRITE "DHCP CLIENT"
+sleep 1
 CREATE_SPINNER "DHCP CLIENT"
 NETMODE DHCP_CLIENT
 STOP_SPINNER
 SCREEN_WRITE "DONE"
-
+sleep 1
 ALERT "Done!" 2 false
 WAIT_FOR_BUTTON
 
 # Enter DHCP Server mode
 SCREEN_WRITE "DHCP SERVER"
+sleep 1
 CREATE_SPINNER "DHCP SERVER"
 NETMODE DHCP_SERVER
 SCREEN_WRITE "DONE"
-
+sleep 1
 ALERT "Done!" 2 false
 WAIT_FOR_BUTTON
 
 # Enter OFF mode, removes configuration, disables interface
 SCREEN_WRITE "OFF"
+sleep 1
+CREATE_SPINNER "NETMODE OFF"
 NETMODE OFF
+STOP_SPINNER
 SCREEN_WRITE "DONE"
-
+sleep 1
 ALERT "Done!" 2 false
 WAIT_FOR_BUTTON
 
 # AUTO mode will capture traffic on the interface and determine if it should enter
 # DHCP client or DHCP server based on if it receives a DHCP REQUEST
 SCREEN_WRITE "AUTO"
+sleep 1
 NETMODE AUTO
 SCREEN_WRITE "DONE"
-
+sleep 1
 ALERT "Done!" 2 false
 WAIT_FOR_BUTTON
 
 # Enter Static IP mode (using defaults provided in config.txt)
 SCREEN_WRITE "STATIC"
+sleep 1
+CREATE_SPINNER "NETMODE STATIC"
 NETMODE STATIC
+STOP_SPINNER
 SCREEN_WRITE "DONE"
-
+sleep 1
 ALERT "Done!" 2 false
 WAIT_FOR_BUTTON
 
 # Enter Static IP mode using custom configuration
 SCREEN_WRITE "Custom STATIC"
+sleep 1
+CREATE_SPINNER "NETMODE CUSTOM"
 NETMODE STATIC IP_192.168.1.100 SUBNET_255.255.255.0 GATEWAY_192.168.1.1
+STOP_SPINNER
 SCREEN_WRITE "DONE"
-
+sleep 1
 SCREEN_WRITE "Demo Complete"
 ALERT "Demo Complete!" -1 false

@@ -35,16 +35,4 @@ fi
 
 sleep 1
 
-SCREEN_WRITE "full width"
-
-sleep 1
-
-# text picker with "dynamic width"
-resp="$(TEXT_PICKER "Password" "     Hunter2     ")"
-if [ "$resp" = "← Back" ]; then
-  SCREEN_WRITE "Cancelled"
-else
-  SCREEN_WRITE "$resp"
-fi
-
 SCREEN_WRITE "Done"

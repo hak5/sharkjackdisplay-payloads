@@ -39,7 +39,7 @@ initialize_menu_system() {
   ADD_MENU_ITEM "Submenu" "submenu1" ""
 
   # on select the exit menu system using the function exit_menu() provided by list_tools
-  ADD_MENU_ITEM "Quit" "exit_menu" ""
+  ADD_MENU_ITEM "Quit" "EXIT_MENU" ""
 
 
 
@@ -62,6 +62,8 @@ initialize_menu_system() {
 SCREEN_WRITE "generating menu"
 initialize_menu_system
 SCREEN_WRITE "starting menu"
+sleep 1
 START_MENU
+sleep 1
 SCREEN_WRITE "menu exited"
 
