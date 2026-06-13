@@ -1,0 +1,264 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Segmentation + Egress Check (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop, scoping a new environment.
+#  Category:    recon / assessment
+#  Version:     1.0
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Characterizes what this one drop is allowed to reach:
+#      - Egress ........... which outbound ports actually escape to the internet
+#                           (open/closed = allowed, filtered = blocked).
+#      - Internet path .... direct vs captive-portal/proxy vs blocked; and the
+#                           cert issuer seen for an external HTTPS site (an
+#                           internal-CA issuer means SSL inspection is in play).
+#      - Gateway mgmt ..... which admin ports on the gateway answer from a user
+#                           drop (mgmt reachable from a user VLAN is a finding).
+#      - Segmentation ..... reachability to the sensitive internal targets you
+#                           list in SEG_TARGETS (server/mgmt VLANs, etc).
+#
+#  AUTHORIZATION
+#    Sends a small number of probes to a configurable external IP and to the
+#    internal targets YOU specify. Run on in-scope networks only, and only set
+#    SEG_TARGETS to ranges the engagement authorizes you to test. Output stays
+#    on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+DHCP_WAIT_SECS=30
+EXT_IP="example.com"               # external probe target (stable, benign)
+EXT_HOST="example.com"         # external hostname for HTTP/TLS path tests
+EGRESS_PORTS="22,25,53,80,443,123,445,3389,1433,8080,8443"
+SEG_TARGETS=""                 # internal ranges/IPs to test reachability TO,
+                               # e.g. "10.10.10.0/24 10.20.0.1". Empty = gateway
+                               # mgmt surface only. Authorized scope ONLY.
+SEG_PORTS="22,23,80,443,445,3389,8443"
+LOOT_BASE="/root/loot/segmentation"
+# VLAN-aware scanning: also tag onto and scan tagged VLANs seen on a trunk.
+SCAN_TAGGED_VLANS=0            # 1 = discover+scan tagged VLANs too. ACTIVE VLAN-
+                              #     hopping; set 0 for client sites unless it is
+                              #     authorized. No-op on a plain access port.
+VLAN_PROBE_IDS=""             # fallback VIDs if none are sniffed, e.g. "2 3 10"
+PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+say()  { SCREEN_WRITE "$*" 2>/dev/null; }
+glow() { LED "$@" 2>/dev/null; }
+spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
+spin_down() { STOP_SPINNER 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+# ============================================================================
+
+
+# ---- VLAN-aware scanning (shared block; keep identical across payloads) -----
+ip_to_int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
+int_to_ip() { local i=$1; echo "$(((i>>24)&255)).$(((i>>16)&255)).$(((i>>8)&255)).$((i&255))"; }
+mask_for()  { local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_cidr() { local ip=$1 p=$2 m; m=$(mask_for "$p"); echo "$(int_to_ip $(( $(ip_to_int "$ip") & m )))/$p"; }
+VLAN_SUBNETS=""                                 # "vid:net/prefix ..." for labeling
+vlan_for_ip() {
+  local ip=$1 ipi entry vid cidr net p m; ipi=$(ip_to_int "$ip")
+  for entry in $VLAN_SUBNETS; do
+    vid=${entry%%:*}; cidr=${entry#*:}; net=${cidr%/*}; p=${cidr#*/}; m=$(mask_for "$p")
+    [ $(( ipi & m )) -eq $(( $(ip_to_int "$net") & m )) ] && { echo "vlan$vid"; return; }
+  done
+  echo "access"
+}
+vlan_candidates() {                             # VIDs to scan: sniffed 802.1Q tags, else fallback
+  local tags=""
+  have tcpdump && tags=$(timeout "${PASSIVE_VLAN_SECS}s" tcpdump -e -nn -i eth0 -c 300 vlan 2>/dev/null \
+    | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
+  [ -z "$tags" ] && tags="$VLAN_PROBE_IDS"
+  echo "$tags"
+}
+# Run <cb> over the native VLAN, then (if enabled) each tagged VLAN: bring up
+# eth0.<vid>, DHCP, derive its CIDR, call "<cb> <iface> <cidr> <label>", tear down.
+run_over_vlans() {                              # run_over_vlans <cb> <native_network_cidr>
+  local cb=$1 ncidr=$2 vid vline vcidr vids
+  "$cb" eth0 "$ncidr" access
+  [ "$SCAN_TAGGED_VLANS" = "1" ] || return
+  have ip || return; have udhcpc || return
+  lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null
+  vids=$(vlan_candidates)
+  for vid in $vids; do
+    ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
+    ip link show "eth0.$vid" >/dev/null 2>&1 || { say "VLAN $vid: no 802.1Q"; continue; }
+    ip link set "eth0.$vid" up 2>/dev/null
+    udhcpc -i "eth0.$vid" -n -q -t 4 -T 3 >/dev/null 2>&1
+    vline=$(ip addr show "eth0.$vid" 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | awk '{print $2}')
+    if [ -n "$vline" ]; then
+      vcidr=$(network_cidr "${vline%/*}" "${vline#*/}")
+      if [ "$vcidr" != "$ncidr" ]; then
+        VLAN_SUBNETS="$VLAN_SUBNETS ${vid}:${vcidr}"
+        "$cb" "eth0.$vid" "$vcidr" "vlan$vid"
+      fi
+    fi
+    ip link set "eth0.$vid" down 2>/dev/null
+    ip link del "eth0.$vid" 2>/dev/null
+  done
+}
+# ----------------------------------------------------------------------------
+
+# ------------------------------ PHASE: SETUP --------------------------------
+glow SETUP
+CLEAR_SCREEN 2>/dev/null
+say "Segmentation + egress"
+if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"; REPORT="$RUN/summary.txt"
+
+
+# --------------------------- PHASE: NETWORK UP ------------------------------
+glow SPECIAL
+say "DHCP lease (eth0)"
+NETMODE DHCP_CLIENT 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
+# Bounded lease wait: WAIT_FOR_IP blocks forever, so keep our own timeout to fail
+# cleanly on a NAC'd / no-DHCP drop instead of running blind.
+IP=""; PREFIX=""
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}')
+  if [ -n "$line" ]; then IP=${line%/*}; PREFIX=${line#*/}; break; fi
+  sleep 1
+done
+if [ -z "$IP" ]; then
+  glow FAIL; say "No lease - 802.1X?"
+  echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
+  ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
+fi
+GATEWAY=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+say "IP $IP/$PREFIX"
+
+
+# ----------------------------- PHASE: EGRESS --------------------------------
+glow STAGE1
+say "Testing egress"
+spin_up "Outbound TCP -> $EXT_IP"
+nmap -Pn --reason -T4 -p "$EGRESS_PORTS" "$EXT_IP" -oN "$RUN/egress_tcp.txt" >/dev/null 2>&1
+nmap -Pn -sU -p53 "$EXT_IP" -oN "$RUN/egress_udp53.txt" >/dev/null 2>&1
+spin_down
+# open|closed => our SYN reached the internet (egress allowed); filtered => blocked.
+EG=$(awk '/^[0-9]+\/tcp/{ split($1,a,"/"); p=a[1]; if($2=="open"||$2=="closed") al=al" "p; else bl=bl" "p }
+         END{ printf "ALLOWED:%s\nBLOCKED:%s\n", al, bl }' "$RUN/egress_tcp.txt" 2>/dev/null)
+EG_ALLOW=$(echo "$EG" | sed -n 's/^ALLOWED://p' | sed 's/^ *//')
+EG_BLOCK=$(echo "$EG" | sed -n 's/^BLOCKED://p' | sed 's/^ *//')
+UDP53=$(awk '/^53\/udp/{print ($2=="open"||$2=="open|filtered")?"allowed":"blocked"}' "$RUN/egress_udp53.txt" 2>/dev/null)
+
+
+# -------------------------- PHASE: INTERNET PATH ----------------------------
+glow STAGE2
+say "Internet path"
+spin_up "HTTP/TLS path"
+BODY=""
+if have wget; then BODY=$(wget -q -O- --timeout=6 "http://$EXT_HOST" 2>/dev/null)
+elif have curl; then BODY=$(curl -s -m 6 "http://$EXT_HOST" 2>/dev/null); fi
+echo "$BODY" > "$RUN/http_probe.txt"
+if echo "$BODY" | grep -qi "Example Domain"; then NETPATH="direct (open web egress)"
+elif [ -n "$BODY" ]; then NETPATH="altered response (captive portal or proxy) - see http_probe.txt"
+else NETPATH="no HTTP egress (blocked or proxy-only)"; fi
+# Cert issuer for an external HTTPS host: an internal CA here == SSL inspection.
+ISSUER="-"
+if have openssl; then
+  ISSUER=$(echo | openssl s_client -connect "${EXT_HOST}:443" -servername "$EXT_HOST" 2>/dev/null \
+           | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
+  [ -z "$ISSUER" ] && ISSUER="(no TLS handshake - egress blocked or proxied)"
+fi
+spin_down
+
+
+# ------------------------- PHASE: GW MGMT + SEGMENTATION --------------------
+glow STAGE3
+say "Gateway mgmt"
+spin_up "Gateway admin ports"
+nmap -Pn -T4 -p22,23,80,443,8443 "$GATEWAY" -oN "$RUN/gateway_mgmt.txt" >/dev/null 2>&1
+spin_down
+GW_OPEN=$(awk '/^[0-9]+\/tcp[ \t]+open/{split($1,a,"/"); printf "%s/%s ", a[1], $3}' "$RUN/gateway_mgmt.txt" 2>/dev/null)
+
+SEG_RESULT="not tested (SEG_TARGETS empty)"
+if [ -n "$SEG_TARGETS" ]; then
+  glow STAGE4
+  say "Segmentation probe"
+  spin_up "Reaching SEG_TARGETS"
+  # shellcheck disable=SC2086
+  nmap -Pn -T4 -p "$SEG_PORTS" $SEG_TARGETS -oG "$RUN/segmentation.gnmap" -oN "$RUN/segmentation.txt" >/dev/null 2>&1
+  spin_down
+  SEG_HOSTS=$(awk -F'\t' '/Ports:/ && /open/{print $0}' "$RUN/segmentation.gnmap" 2>/dev/null \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ')
+  if [ -n "$SEG_HOSTS" ]; then SEG_RESULT="REACHABLE (segmentation gap): $SEG_HOSTS"
+  else SEG_RESULT="no listed targets reachable on $SEG_PORTS (segmented)"; fi
+fi
+
+
+# ----------------------- PHASE: PER-VLAN EGRESS -----------------------------
+# For each tagged VLAN: does IT have egress, and is its gateway admin reachable?
+# (Native tested above on the native route; scan_one skips the "access" label.
+#  udhcpc points the default route at each VLAN's gateway as we go.)
+: > "$RUN/vlan_egress.txt"
+scan_one() {                                    # scan_one <iface> <cidr> <label>
+  local iface=$1 cidr=$2 label=$3 gw egal gwopen
+  [ "$label" = "access" ] && return
+  say "$label: egress + gw"
+  gw=$(ip route 2>/dev/null | awk -v d="$iface" '/default/ && $0 ~ ("dev "d){print $3; exit}')
+  [ -z "$gw" ] && gw=$(echo "$cidr" | sed 's,0/.*,1,')
+  nmap -Pn --reason -T4 -e "$iface" -p "$EGRESS_PORTS" "$EXT_IP" -oN "$RUN/egress_$label.txt" >/dev/null 2>&1
+  egal=$(awk '/^[0-9]+\/tcp/{split($1,a,"/"); if($2=="open"||$2=="closed") s=s" "a[1]} END{print s}' "$RUN/egress_$label.txt" 2>/dev/null | sed 's/^ *//')
+  nmap -Pn -T4 -e "$iface" -p22,23,80,443,8443 "$gw" -oN "$RUN/gwmgmt_$label.txt" >/dev/null 2>&1
+  gwopen=$(awk '/^[0-9]+\/tcp[ \t]+open/{split($1,a,"/"); printf "%s/%s ",a[1],$3}' "$RUN/gwmgmt_$label.txt" 2>/dev/null)
+  { echo " $label  ($cidr, gw $gw)"
+    echo "   Egress allowed : ${egal:-none}"
+    echo "   GW admin open  : ${gwopen:-none}"
+  } >> "$RUN/vlan_egress.txt"
+}
+if [ "$SCAN_TAGGED_VLANS" = "1" ]; then
+  glow STAGE5
+  say "Per-VLAN egress"
+  run_over_vlans scan_one "$(network_cidr "$IP" "$PREFIX")"
+fi
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+glow CLEANUP
+say "Writing loot"
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - SEGMENTATION + EGRESS"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Our lease: $IP/$PREFIX     Gateway: ${GATEWAY:-unknown}"
+  echo ""
+  echo "---- EGRESS (outbound to $EXT_IP) ------------------------"
+  echo " Allowed TCP ports : ${EG_ALLOW:-none}"
+  echo " Blocked TCP ports : ${EG_BLOCK:-none}"
+  echo " Outbound DNS (UDP/53): ${UDP53:-unknown}"
+  echo ""
+  echo "---- INTERNET PATH ---------------------------------------"
+  echo " HTTP path     : $NETPATH"
+  echo " Ext TLS issuer: $ISSUER"
+  echo "   (an internal/corporate CA issuer here means SSL inspection)"
+  echo ""
+  echo "---- GATEWAY MGMT EXPOSURE -------------------------------"
+  echo " Open admin ports on ${GATEWAY:-gateway}: ${GW_OPEN:-none}"
+  echo "   (management reachable from a user drop is worth flagging)"
+  echo ""
+  echo "---- SEGMENTATION ----------------------------------------"
+  echo " $SEG_RESULT"
+  echo ""
+  echo "---- PER-VLAN EGRESS (tagged) ----------------------------"
+  if [ -s "$RUN/vlan_egress.txt" ]; then cat "$RUN/vlan_egress.txt"; else echo " (no tagged VLANs scanned)"; fi
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " egress_tcp.txt egress_udp53.txt http_probe.txt"
+  echo " gateway_mgmt.txt segmentation.txt (when SEG_TARGETS set)"
+  echo "=========================================================="
+} > "$REPORT"
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+glow FINISH
+CLEAR_SCREEN 2>/dev/null
+say "Seg/egress done"
+say "Egress: ${EG_ALLOW:-none}"
+ALERT "Seg/egress done. Allowed out: ${EG_ALLOW:-none}." 12 2>/dev/null
+exit 0

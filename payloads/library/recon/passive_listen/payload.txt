@@ -1,0 +1,205 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Passive Listener (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop, scoping a new environment.
+#  Category:    recon (passive)
+#  Version:     1.0
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Brings the link up, sends (almost) nothing, and listens. In one window it
+#    harvests the stuff a switch tells you for free:
+#      - LLDP / CDP ......... switch name, model, software, the PORT you are
+#                             patched into, native VLAN, switch management IP.
+#      - mDNS / SSDP / UPnP .. device landscape (printers, Apple, TVs, cameras).
+#      - NetBIOS / LLMNR .... Windows names + naming conventions.
+#      - Passive ARP ........ live hosts with zero probes (IP + MAC + vendor).
+#      - DHCP / STP ......... DHCP servers seen, spanning-tree presence.
+#    Keeps the full pcap plus decoded per-protocol text for later analysis.
+#
+#  WHY FIRST
+#    A single LLDP/CDP frame often describes the switching estate better than an
+#    hour of scanning, and this is about as quiet as recon gets: no port scans,
+#    no unicast probes. Ideal opening move on an unfamiliar network.
+#
+#  AUTHORIZATION
+#    Passive capture only. Runs on networks you own or are contracted to assess.
+#    Do not retain third-party payload data beyond the engagement scope. All
+#    output stays on-device in /root/loot until you pull it.
+#
+#  REQUIRES tcpdump:  opkg update && opkg install tcpdump
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+LISTEN_SECS=120                 # capture window. LLDP/CDP announce every 30-60s,
+                                # so >=90s is wise to catch at least one cycle.
+LOOT_BASE="/root/loot/passive"
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+say()  { SCREEN_WRITE "$*" 2>/dev/null; }
+glow() { LED "$@" 2>/dev/null; }
+spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
+spin_down() { STOP_SPINNER 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Lift an LLDP TLV value out of tcpdump -v output, tolerant of both formats:
+# value inline after the label's colon, OR on the following line. <file> <label>
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val); sub(/^Subtype[^:]*: /,"",val); print val; exit
+    }' "$1" 2>/dev/null
+}
+# ============================================================================
+
+
+# ------------------------------ PHASE: SETUP --------------------------------
+glow SETUP
+CLEAR_SCREEN 2>/dev/null
+say "Passive listen starting"
+
+if ! have tcpdump; then
+  glow FAIL
+  say "tcpdump missing"
+  ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
+  exit 1
+fi
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+PCAP="$RUN/capture.pcap"
+
+# Link up, no IP: we want frames flowing without us announcing an address.
+ip link set eth0 up 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null            # don't start the capture before carrier is up
+
+
+# ---------------------------- PHASE: LISTEN ---------------------------------
+glow SPECIAL
+say "Listening ${LISTEN_SECS}s"
+CREATE_PROGRESS_BAR "Capturing traffic" 2>/dev/null
+# -p would disable promisc; we WANT promisc so multicast control frames arrive.
+tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null &
+TPID=$!
+for i in $(seq 1 "$LISTEN_SECS"); do
+  SET_PROGRESS $(( i * 100 / LISTEN_SECS )) 2>/dev/null
+  sleep 1
+done
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+SET_PROGRESS 100 2>/dev/null
+
+
+# --------------------------- PHASE: DECODE ----------------------------------
+glow STAGE1
+say "Decoding capture"
+
+# --- LLDP (0x88cc) and CDP (Cisco multicast 01:00:0c:cc:cc:cc) ---
+spin_up "Switch neighbors (LLDP/CDP)"
+tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+spin_down
+
+# LLDP fields (best-effort; full decode kept in lldp.txt).
+L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+L_DESC=$(lldp_field "$RUN/lldp.txt" 'System Description TLV')
+L_MGMT=$(grep -i 'Management Address' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+L_VLAN=$(grep -iE 'PVID|Port VLAN ID' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+
+# CDP fields.
+C_DEV=$(grep -i 'Device-ID'   "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_PLAT=$(grep -i 'Platform'   "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_PORT=$(grep -i 'Port-ID'    "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_NVLAN=$(grep -i 'Native VLAN' "$RUN/cdp.txt" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1)
+C_ADDR=$(grep -iA2 'Address' "$RUN/cdp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+# --- Passive ARP -> live host list (no probes sent by us) ---
+# Captures (ip, mac) from "who-has X tell <ip>" (sender) and "<ip> is-at <mac>".
+spin_up "Passive ARP hosts"
+tcpdump -nn -e -r "$PCAP" arp 2>/dev/null | awk '
+  {
+    mac=""
+    for (i=1;i<=NF;i++) if (mac=="" && $i ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) mac=$i   # sender MAC
+    for (i=1;i<=NF;i++) {
+      if ($i=="tell")  { ip=$(i+1);   gsub(/[,:]$/,"",ip);   if (ip ~ /^[0-9]+\./ && mac!="") print ip"\t"mac }
+      if ($i=="is-at") { ip=$(i-1); gsub(/[,:]$/,"",ip); m=$(i+1); gsub(/[,:]$/,"",m); if (ip ~ /^[0-9]+\./ && m ~ /:/) print ip"\t"m }
+    }
+  }' | sort -u > "$RUN/arp_hosts.tsv"
+ARPN=$(wc -l < "$RUN/arp_hosts.tsv" 2>/dev/null | tr -d ' '); [ -z "$ARPN" ] && ARPN=0
+spin_down
+
+# --- mDNS / SSDP / NetBIOS / DHCP responders ---
+spin_up "mDNS / SSDP / NetBIOS"
+tcpdump -nn -r "$PCAP" 'udp port 5353' 2>/dev/null | grep -oE '[A-Za-z0-9_-]+\.(local|_tcp|_udp)' | sort -u > "$RUN/mdns.txt"
+tcpdump -nn -A -r "$PCAP" 'udp port 1900' 2>/dev/null | grep -iE '^(SERVER|LOCATION|ST|USN):' | sort -u > "$RUN/ssdp.txt"
+tcpdump -nn -r "$PCAP" 'udp port 137'  2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u > "$RUN/netbios_ips.txt"
+DHCP_SRV=$(tcpdump -nn -r "$PCAP" '(udp port 67 or udp port 68)' 2>/dev/null | grep -oiE 'Server-ID Option[^,]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ')
+STP_SEEN=$(tcpdump -nn -r "$PCAP" 'stp' 2>/dev/null | head -1)
+spin_down
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+glow CLEANUP
+say "Writing loot"
+MDNSN=$(wc -l < "$RUN/mdns.txt" 2>/dev/null | tr -d ' '); [ -z "$MDNSN" ] && MDNSN=0
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - PASSIVE LISTENER"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Window   : ${LISTEN_SECS}s passive capture on eth0"
+  echo ""
+  echo "---- SWITCH NEIGHBOR (LLDP) ------------------------------"
+  echo " System name : ${L_NAME:--}"
+  echo " Description : ${L_DESC:--}"
+  echo " Our port    : ${L_PORT:--}"
+  echo " Mgmt IP     : ${L_MGMT:--}"
+  echo " VLAN        : ${L_VLAN:--}"
+  echo ""
+  echo "---- SWITCH NEIGHBOR (CDP) -------------------------------"
+  echo " Device-ID   : ${C_DEV:--}"
+  echo " Platform    : ${C_PLAT:--}"
+  echo " Our port    : ${C_PORT:--}"
+  echo " Native VLAN : ${C_NVLAN:--}"
+  echo " Mgmt IP     : ${C_ADDR:--}"
+  echo ""
+  echo "---- INFRASTRUCTURE --------------------------------------"
+  echo " DHCP servers seen : ${DHCP_SRV:-none}"
+  echo " Spanning-tree     : $([ -n "$STP_SEEN" ] && echo "present" || echo "not seen")"
+  echo ""
+  echo "---- PASSIVE HOSTS (ARP, $ARPN seen) ---------------------"
+  if [ "$ARPN" -gt 0 ]; then
+    printf " %-15s %s\n" "IP" "MAC"
+    awk -F'\t' '{printf " %-15s %s\n",$1,$2}' "$RUN/arp_hosts.tsv"
+  else
+    echo " (none observed in window)"
+  fi
+  echo ""
+  echo "---- mDNS / BONJOUR NAMES ($MDNSN) -----------------------"
+  if [ "$MDNSN" -gt 0 ]; then sed 's/^/ /' "$RUN/mdns.txt"; else echo " (none)"; fi
+  echo ""
+  echo "---- SSDP / UPnP DEVICES ---------------------------------"
+  if [ -s "$RUN/ssdp.txt" ]; then sed 's/^/ /' "$RUN/ssdp.txt"; else echo " (none)"; fi
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " capture.pcap   - full passive capture (open in Wireshark)"
+  echo " lldp.txt / cdp.txt - full neighbor decode"
+  echo " mdns/ssdp/netbios/arp_hosts - per-protocol extracts"
+  echo "=========================================================="
+} > "$REPORT"
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+glow FINISH
+NEIGH="${L_NAME:-$C_DEV}"
+CLEAR_SCREEN 2>/dev/null
+say "Passive listen done"
+say "Switch: ${NEIGH:-unknown}"
+say "Hosts(ARP): $ARPN"
+ALERT "Passive done. Switch: ${NEIGH:-?}, $ARPN hosts seen." 12 2>/dev/null
+exit 0

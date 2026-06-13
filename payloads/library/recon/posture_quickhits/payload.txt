@@ -1,0 +1,233 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Security Posture Quick-Hits (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop, scoping a new environment.
+#  Category:    recon / assessment
+#  Version:     1.0
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Sweeps the live hosts for the findings that actually drive a remediation
+#    proposal, and writes them as a severity-tagged list:
+#      - SMBv1 still enabled           (HIGH, ransomware-relevant)
+#      - SMB signing not required      (HIGH)
+#      - SNMP default community 'public'(MED, leaks gear config)
+#      - Legacy cleartext: telnet/ftp/r-services (MED/LOW)
+#      - Exposed RDP / VNC             (MED)
+#      - Legacy TLS (1.0/SSLv3), weak cipher grades (LOW)
+#    Targeted scripts run only against hosts with the relevant port open, so it
+#    stays reasonably quick.
+#
+#  AUTHORIZATION
+#    Active, authenticated-to-nothing assessment scans against the in-scope
+#    network only. Default SNMP community testing and SMB enumeration are
+#    standard assessment steps; stay within authorized scope. Output stays
+#    on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+DHCP_WAIT_SECS=30
+NMAP_TIMING="-T4"
+HOST_TIMEOUT="60s"
+SNMP_COMMUNITIES="public private"   # default strings to test (UDP/161)
+LOOT_BASE="/root/loot/posture"
+# VLAN-aware scanning: also tag onto and scan tagged VLANs seen on a trunk.
+SCAN_TAGGED_VLANS=0            # 1 = discover+scan tagged VLANs too. ACTIVE VLAN-
+                              #     hopping; set 0 for client sites unless it is
+                              #     authorized. No-op on a plain access port.
+VLAN_PROBE_IDS=""             # fallback VIDs if none are sniffed, e.g. "2 3 10"
+PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+say()  { SCREEN_WRITE "$*" 2>/dev/null; }
+glow() { LED "$@" 2>/dev/null; }
+spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
+spin_down() { STOP_SPINNER 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Hosts whose nmap -oN block contains a line matching <regex>. Space-separated.
+hosts_matching() {                              # hosts_matching <oN_file> <regex>
+  awk -v re="$2" '
+    /^Nmap scan report for /{h=$0; sub(/^Nmap scan report for /,"",h); next}
+    $0 ~ re { if (h!="" && !s[h]) { print h; s[h]=1 } }
+  ' "$1" 2>/dev/null | tr '\n' ' '
+}
+# Emit a finding line only when there are affected hosts; count it.
+NFIND=0
+finding() {                                     # finding <severity> <text> <hosts>
+  [ -z "$3" ] && return
+  NFIND=$((NFIND+1))
+  printf " [%s] %s\n        %s\n" "$1" "$2" "$3" >> "$REPORT"
+}
+# ============================================================================
+
+
+# ---- VLAN-aware scanning (shared block; keep identical across payloads) -----
+ip_to_int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
+int_to_ip() { local i=$1; echo "$(((i>>24)&255)).$(((i>>16)&255)).$(((i>>8)&255)).$((i&255))"; }
+mask_for()  { local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_cidr() { local ip=$1 p=$2 m; m=$(mask_for "$p"); echo "$(int_to_ip $(( $(ip_to_int "$ip") & m )))/$p"; }
+VLAN_SUBNETS=""                                 # "vid:net/prefix ..." for labeling
+vlan_for_ip() {
+  local ip=$1 ipi entry vid cidr net p m; ipi=$(ip_to_int "$ip")
+  for entry in $VLAN_SUBNETS; do
+    vid=${entry%%:*}; cidr=${entry#*:}; net=${cidr%/*}; p=${cidr#*/}; m=$(mask_for "$p")
+    [ $(( ipi & m )) -eq $(( $(ip_to_int "$net") & m )) ] && { echo "vlan$vid"; return; }
+  done
+  echo "access"
+}
+vlan_candidates() {                             # VIDs to scan: sniffed 802.1Q tags, else fallback
+  local tags=""
+  have tcpdump && tags=$(timeout "${PASSIVE_VLAN_SECS}s" tcpdump -e -nn -i eth0 -c 300 vlan 2>/dev/null \
+    | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
+  [ -z "$tags" ] && tags="$VLAN_PROBE_IDS"
+  echo "$tags"
+}
+# Run <cb> over the native VLAN, then (if enabled) each tagged VLAN: bring up
+# eth0.<vid>, DHCP, derive its CIDR, call "<cb> <iface> <cidr> <label>", tear down.
+run_over_vlans() {                              # run_over_vlans <cb> <native_network_cidr>
+  local cb=$1 ncidr=$2 vid vline vcidr vids
+  "$cb" eth0 "$ncidr" access
+  [ "$SCAN_TAGGED_VLANS" = "1" ] || return
+  have ip || return; have udhcpc || return
+  lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null
+  vids=$(vlan_candidates)
+  for vid in $vids; do
+    ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
+    ip link show "eth0.$vid" >/dev/null 2>&1 || { say "VLAN $vid: no 802.1Q"; continue; }
+    ip link set "eth0.$vid" up 2>/dev/null
+    udhcpc -i "eth0.$vid" -n -q -t 4 -T 3 >/dev/null 2>&1
+    vline=$(ip addr show "eth0.$vid" 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | awk '{print $2}')
+    if [ -n "$vline" ]; then
+      vcidr=$(network_cidr "${vline%/*}" "${vline#*/}")
+      if [ "$vcidr" != "$ncidr" ]; then
+        VLAN_SUBNETS="$VLAN_SUBNETS ${vid}:${vcidr}"
+        "$cb" "eth0.$vid" "$vcidr" "vlan$vid"
+      fi
+    fi
+    ip link set "eth0.$vid" down 2>/dev/null
+    ip link del "eth0.$vid" 2>/dev/null
+  done
+}
+# ----------------------------------------------------------------------------
+
+# ------------------------------ PHASE: SETUP --------------------------------
+glow SETUP
+CLEAR_SCREEN 2>/dev/null
+say "Posture quick-hits"
+if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"; REPORT="$RUN/summary.txt"
+
+
+# --------------------------- PHASE: NETWORK UP ------------------------------
+glow SPECIAL
+say "DHCP lease (eth0)"
+NETMODE DHCP_CLIENT 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
+# Bounded lease wait: WAIT_FOR_IP blocks forever, so keep our own timeout to fail
+# cleanly on a NAC'd / no-DHCP drop instead of running blind.
+IP=""; PREFIX=""
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}')
+  if [ -n "$line" ]; then IP=${line%/*}; PREFIX=${line#*/}; break; fi
+  sleep 1
+done
+if [ -z "$IP" ]; then
+  glow FAIL; say "No lease - 802.1X?"
+  echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
+  ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
+fi
+say "IP $IP/$PREFIX"
+
+
+# ----------------------- PHASE: DISCOVER + SCAN -----------------------------
+SNMP_ARGS=$(echo "$SNMP_COMMUNITIES" | sed 's/ /,/g')
+# Posture-scan one (iface, cidr): discover, then SMB / SNMP / legacy / TLS.
+# Per-label raw files so the native VLAN and each tagged VLAN accumulate.
+scan_one() {                                    # scan_one <iface> <cidr> <label>
+  local iface=$1 cidr=$2 label=$3 n L
+  nmap -sn $NMAP_TIMING -e "$iface" -oG "$RUN/disc_$label.gnmap" "$cidr" >/dev/null 2>&1
+  awk '/Status: Up/{print $2}' "$RUN/disc_$label.gnmap" 2>/dev/null | sort -u > "$RUN/up_$label.txt"
+  n=$(wc -l < "$RUN/up_$label.txt" 2>/dev/null | tr -d ' '); [ -z "$n" ] && n=0
+  [ "$n" -eq 0 ] && return
+  say "$label: $n hosts"
+  L="$RUN/up_$label.txt"
+  nmap -Pn $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" -e "$iface" -p139,445 \
+    --script smb-protocols,smb2-security-mode,smb-os-discovery -iL "$L" -oN "$RUN/smb_$label.txt" >/dev/null 2>&1
+  nmap -Pn -sU $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" -e "$iface" -p161 \
+    --script snmp-info --script-args "snmpcommunity={$SNMP_ARGS}" -iL "$L" -oN "$RUN/snmp_$label.txt" >/dev/null 2>&1
+  nmap -Pn $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" -e "$iface" -p21,23,512,513,514,3389,5900 \
+    -iL "$L" -oN "$RUN/legacy_$label.txt" >/dev/null 2>&1
+  nmap -Pn $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" -e "$iface" -p443,636,993,995,8443,9443 \
+    --script ssl-cert,ssl-enum-ciphers -iL "$L" -oN "$RUN/tls_$label.txt" >/dev/null 2>&1
+}
+
+glow STAGE1
+say "Scanning (native + tagged VLANs)"
+spin_up "Posture scan"
+NATIVE_CIDR=$(network_cidr "$IP" "$PREFIX")
+run_over_vlans scan_one "$NATIVE_CIDR"
+spin_down
+
+# Merge per-VLAN raw output so the findings logic sees every VLAN.
+cat "$RUN"/smb_*.txt    > "$RUN/smb.txt"    2>/dev/null
+cat "$RUN"/snmp_*.txt   > "$RUN/snmp.txt"   2>/dev/null
+cat "$RUN"/legacy_*.txt > "$RUN/legacy.txt" 2>/dev/null
+cat "$RUN"/tls_*.txt    > "$RUN/tls.txt"    2>/dev/null
+cat "$RUN"/up_*.txt 2>/dev/null | sort -u > "$RUN/up.txt"
+UPCOUNT=$(wc -l < "$RUN/up.txt" 2>/dev/null | tr -d ' '); [ -z "$UPCOUNT" ] && UPCOUNT=0
+say "$UPCOUNT hosts up"
+if [ "$UPCOUNT" -eq 0 ]; then
+  glow FAIL; echo "No live hosts discovered on $IP/$PREFIX (any VLAN)." > "$REPORT"
+  ALERT "No hosts found" 8 2>/dev/null; exit 0
+fi
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+glow CLEANUP
+say "Scoring findings"
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - POSTURE QUICK-HITS"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " From     : $IP/$PREFIX     Hosts scanned: $UPCOUNT"
+  echo " VLANs    : native $(network_cidr "$IP" "$PREFIX")${VLAN_SUBNETS:+ ; tagged}${VLAN_SUBNETS}"
+  echo ""
+  echo "---- FINDINGS (severity / affected hosts) ----------------"
+} > "$REPORT"
+
+finding HIGH "SMBv1 enabled"                  "$(hosts_matching "$RUN/smb.txt" 'SMBv1')"
+finding HIGH "SMB signing not required"       "$(hosts_matching "$RUN/smb.txt" 'not required')"
+finding MED  "SNMP default community responds" "$(hosts_matching "$RUN/snmp.txt" 'snmp-info|snmpEngine|System uptime')"
+finding MED  "Telnet (23) open - cleartext"   "$(hosts_matching "$RUN/legacy.txt" '^23/tcp[ \t]+open')"
+finding LOW  "FTP (21) open - cleartext"      "$(hosts_matching "$RUN/legacy.txt" '^21/tcp[ \t]+open')"
+finding MED  "r-services (512/513/514) open"  "$(hosts_matching "$RUN/legacy.txt" '^(512|513|514)/tcp[ \t]+open')"
+finding MED  "RDP (3389) exposed"             "$(hosts_matching "$RUN/legacy.txt" '^3389/tcp[ \t]+open')"
+finding MED  "VNC (5900) open"                "$(hosts_matching "$RUN/legacy.txt" '^5900/tcp[ \t]+open')"
+finding LOW  "Legacy TLS/SSL (1.0 / SSLv3)"   "$(hosts_matching "$RUN/tls.txt" 'TLSv1\.0|SSLv3|SSLv2')"
+finding LOW  "Weak TLS cipher grade (C/D/F)"  "$(hosts_matching "$RUN/tls.txt" 'least strength: [CDF]')"
+
+if [ "$NFIND" -eq 0 ]; then echo " No quick-hit findings (clean on the checks run)." >> "$REPORT"; fi
+{
+  echo ""
+  echo "---- NOTES -----------------------------------------------"
+  echo " Full per-host output (incl. cert subjects/expiry, SMB OS,"
+  echo " SNMP system info) is in the raw files below."
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " smb.txt  snmp.txt  legacy.txt  tls.txt  discovery.gnmap"
+  echo "=========================================================="
+} >> "$REPORT"
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+glow FINISH
+CLEAR_SCREEN 2>/dev/null
+say "Posture scan done"
+say "Findings: $NFIND"
+say "Hosts: $UPCOUNT"
+ALERT "Posture done: $NFIND finding categories across $UPCOUNT hosts." 12 2>/dev/null
+exit 0
