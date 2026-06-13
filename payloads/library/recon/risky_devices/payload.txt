@@ -1,0 +1,354 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Rogue / Risky Device Detector (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop, scoping a new environment.
+#  Category:    recon / assessment
+#  Version:     1.0
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Finds the devices nobody remembers plugging in and the ones that don't
+#    belong, then writes a leadership-ready table:
+#        Device | Manufacturer | Version | IP | Open Ports
+#    It classifies every live host by fusing three signals:
+#      - MAC OUI (manufacturer) ... incl. a built-in table for Raspberry Pi and
+#                                   Espressif/ESP so they're caught even when the
+#                                   device's nmap OUI database is stale.
+#      - Open-port fingerprint .... 9100->printer, 554->camera, 7547->consumer
+#                                   router, DB/container ports on a desktop OS->
+#                                   "laptop running production workloads".
+#      - Banners / OS / hostname .. raspbian, jetdirect, hikvision, openwrt, etc.
+#    Risky/unexpected devices are listed FIRST (the leadership headline); the
+#    full inventory follows.
+#
+#  CATCHES (the usual suspects)
+#    Raspberry Pi / SBCs, consumer Wi-Fi routers/APs, printers/MFPs, IP cameras,
+#    DIY/IoT boards, and endpoints (laptops/desktops) exposing server, database,
+#    or container ports they shouldn't.
+#
+#  AUTHORIZATION
+#    Active inventory scan against the in-scope network only. Output stays
+#    on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+DHCP_WAIT_SECS=30
+NMAP_TIMING="-T4"
+HOST_TIMEOUT="120s"
+OS_DETECT=1                     # 1 = nmap -O (helps tell a server from a laptop)
+SNMP_LOOKUP=1                   # 1 = pull SNMP sysDescr (printer/switch firmware)
+# Classification-signal ports (kept short for speed + signal).
+PORTSET="21,22,23,25,53,80,110,143,443,445,515,554,623,631,1883,1900,2375,2376,3000,3306,3389,5000,5060,5432,5900,6379,7547,8000,8080,8443,8888,9000,9100,9200,27017"
+LOOT_BASE="/root/loot/risky"
+# VLAN-aware scanning: also tag onto and scan tagged VLANs seen on a trunk.
+SCAN_TAGGED_VLANS=0            # 1 = discover+scan tagged VLANs too. ACTIVE VLAN-
+                              #     hopping; set 0 for client sites unless it is
+                              #     authorized. No-op on a plain access port.
+VLAN_PROBE_IDS=""             # fallback VIDs if none are sniffed, e.g. "2 3 10"
+PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+say()  { SCREEN_WRITE "$*" 2>/dev/null; }
+glow() { LED "$@" 2>/dev/null; }
+spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
+spin_down() { STOP_SPINNER 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Built-in OUI table for the high-signal DIY devices nmap's DB often misses.
+# Sets OUI_TYPE (rpi|esp) and OUI_VENDOR. <mac>
+oui_lookup() {
+  OUI_TYPE=""; OUI_VENDOR=""
+  local o; o=$(echo "$1" | cut -c1-8 | tr 'a-z' 'A-Z')
+  case "$o" in
+    B8:27:EB|DC:A6:32|E4:5F:01|28:CD:C1|D8:3A:DD|2C:CF:67|3A:35:41)
+      OUI_TYPE=rpi; OUI_VENDOR="Raspberry Pi" ;;
+    18:FE:34|5C:CF:7F|24:0A:C4|30:AE:A4|3C:71:BF|60:01:94|68:C6:3A|7C:9E:BD|84:CC:A8|84:F3:EB|A0:20:A6|A4:CF:12|B4:E6:2D|BC:DD:C2|C4:4F:33|CC:50:E3|D8:A0:1D|DC:4F:22|EC:FA:BC|F4:CF:A2)
+      OUI_TYPE=esp; OUI_VENDOR="Espressif (ESP32/8266)" ;;
+  esac
+}
+
+# Classify a host. Sets CT (device type), CR (risk), CRE (reason).
+# Args: vendor os host ports(comma) banner(lowercased)
+classify() {
+  local vendor="$1" os="$2" host="$3" ports="$4" banner="$5"
+  local hay; hay=$(printf '%s %s %s %s' "$vendor" "$os" "$host" "$banner" | tr 'A-Z' 'a-z')
+  local pl=",$ports,"
+  has() { case "$pl" in *,$1,*) return 0;; *) return 1;; esac; }
+  srv_port() { echo "$pl" | grep -qE ',(80|443|3000|5000|8000|8080|8443|8888|9000|3306|5432|6379|27017|1433|9200|2375|2376|5601),'; }
+
+  if [ "$OUI_TYPE" = "rpi" ] || echo "$hay" | grep -qE 'raspberr|raspbian|octopi'; then
+    CT="Raspberry Pi / SBC"; CR="HIGH"; CRE="unmanaged single-board computer"; return; fi
+  if has 9100 || has 515 || has 631 || echo "$hay" | grep -qE 'jetdirect|laserjet|officejet|printer|hewlett|hp inc|canon|epson|brother|lexmark|xerox|ricoh|kyocera|konica'; then
+    CT="Printer / MFP"; CR="MEDIUM"; CRE="often unpatched, default creds, holds scanned docs"; return; fi
+  if has 554 || echo "$hay" | grep -qE 'rtsp|onvif|hikvision|dahua|\baxis\b|reolink|wyze|amcrest|nvr|ip ?cam|goahead|boa/'; then
+    CT="IP camera / NVR"; CR="HIGH"; CRE="cameras are commonly default-cred and exposed"; return; fi
+  if has 7547 || echo "$hay" | grep -qE 'tp-?link|netgear|linksys|d-?link|asus|belkin|tenda|mikrotik|openwrt|dd-?wrt|router|wireless ap'; then
+    CT="Consumer router / AP"; CR="HIGH"; CRE="rogue network gear / unmanaged uplink"; return; fi
+  if [ "$OUI_TYPE" = "esp" ] || has 1883 || echo "$hay" | grep -qE 'espressif|esp32|esp8266|tuya|sonoff|shelly|tasmota|arduino|nodemcu|particle|broadlink|smartthings'; then
+    CT="IoT / DIY embedded"; CR="MEDIUM"; CRE="unmanaged IoT, weak or absent patching"; return; fi
+  if has 5060 || echo "$hay" | grep -qE 'polycom|yealink|grandstream|cisco ip phone|sip/'; then
+    CT="VoIP phone"; CR="INFO"; CRE="expected if they run VoIP"; return; fi
+  # Endpoint (desktop OS / laptop vendor) exposing hosting ports = prod-on-a-laptop.
+  if echo "$hay" | grep -qE 'windows (xp|7|8|10|11)|mac ?os|macos|darwin|apple|macbook|dell|lenovo|thinkpad|optiplex|microsoft|intel corporate' \
+     && ! echo "$hay" | grep -qE 'windows server' && srv_port; then
+    CT="Endpoint running services"; CR="HIGH"; CRE="possible production workload on a user device"; return; fi
+  if echo "$hay" | grep -qE 'windows server|ubuntu|debian|centos|red hat|linux' && srv_port; then
+    CT="Server (verify it's sanctioned)"; CR="REVIEW"; CRE="confirm this host is inventoried and owned"; return; fi
+  if echo "$hay" | grep -qE 'cisco|juniper|aruba|\bhpe\b|ubiquiti|unifi|fortinet|sonicwall|meraki|extreme|brocade'; then
+    CT="Network device"; CR="REVIEW"; CRE="infrastructure - confirm it is sanctioned"; return; fi
+  if echo "$hay" | grep -qE 'windows|desktop-|laptop-'; then CT="Windows workstation"; CR="LOW"; CRE="normal endpoint"; return; fi
+  if echo "$hay" | grep -qE 'apple|mac ?os|macos'; then CT="Apple device"; CR="LOW"; CRE="normal endpoint"; return; fi
+  CT="Unknown"; CR="REVIEW"; CRE="unclassified - verify ownership"
+}
+risk_rank() { case "$1" in HIGH) echo 1;; MEDIUM) echo 2;; REVIEW) echo 3;; LOW) echo 4;; *) echo 5;; esac; }
+# Manufacturer fallback from banner/SNMP keywords when the OUI is unknown.
+guess_vendor() {
+  case "$1" in
+    *raspberr*|*raspbian*) echo "Raspberry Pi";;
+    *espressif*|*esp8266*|*esp32*|*tasmota*) echo "Espressif";;
+    *hewlett*|*laserjet*|*officejet*|*jetdirect*) echo "HP";;
+    *canon*) echo "Canon";; *epson*) echo "Epson";; *brother*) echo "Brother";;
+    *lexmark*) echo "Lexmark";; *xerox*) echo "Xerox";; *ricoh*) echo "Ricoh";; *kyocera*) echo "Kyocera";;
+    *hikvision*) echo "Hikvision";; *dahua*) echo "Dahua";; *amcrest*) echo "Amcrest";; *reolink*) echo "Reolink";;
+    *tp-link*|*tplink*) echo "TP-Link";; *netgear*) echo "Netgear";; *linksys*) echo "Linksys";;
+    *d-link*|*dlink*) echo "D-Link";; *mikrotik*) echo "MikroTik";; *openwrt*) echo "OpenWrt device";;
+    *ubiquiti*|*unifi*) echo "Ubiquiti";; *cisco*) echo "Cisco";; *juniper*) echo "Juniper";;
+    *aruba*) echo "Aruba";; *fortinet*) echo "Fortinet";; *) echo "";;
+  esac
+}
+# ============================================================================
+
+
+# ---- VLAN-aware scanning (shared block; keep identical across payloads) -----
+ip_to_int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
+int_to_ip() { local i=$1; echo "$(((i>>24)&255)).$(((i>>16)&255)).$(((i>>8)&255)).$((i&255))"; }
+mask_for()  { local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_cidr() { local ip=$1 p=$2 m; m=$(mask_for "$p"); echo "$(int_to_ip $(( $(ip_to_int "$ip") & m )))/$p"; }
+VLAN_SUBNETS=""                                 # "vid:net/prefix ..." for labeling
+vlan_for_ip() {
+  local ip=$1 ipi entry vid cidr net p m; ipi=$(ip_to_int "$ip")
+  for entry in $VLAN_SUBNETS; do
+    vid=${entry%%:*}; cidr=${entry#*:}; net=${cidr%/*}; p=${cidr#*/}; m=$(mask_for "$p")
+    [ $(( ipi & m )) -eq $(( $(ip_to_int "$net") & m )) ] && { echo "vlan$vid"; return; }
+  done
+  echo "access"
+}
+vlan_candidates() {                             # VIDs to scan: sniffed 802.1Q tags, else fallback
+  local tags=""
+  have tcpdump && tags=$(timeout "${PASSIVE_VLAN_SECS}s" tcpdump -e -nn -i eth0 -c 300 vlan 2>/dev/null \
+    | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
+  [ -z "$tags" ] && tags="$VLAN_PROBE_IDS"
+  echo "$tags"
+}
+# Run <cb> over the native VLAN, then (if enabled) each tagged VLAN: bring up
+# eth0.<vid>, DHCP, derive its CIDR, call "<cb> <iface> <cidr> <label>", tear down.
+run_over_vlans() {                              # run_over_vlans <cb> <native_network_cidr>
+  local cb=$1 ncidr=$2 vid vline vcidr vids
+  "$cb" eth0 "$ncidr" access
+  [ "$SCAN_TAGGED_VLANS" = "1" ] || return
+  have ip || return; have udhcpc || return
+  lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null
+  vids=$(vlan_candidates)
+  for vid in $vids; do
+    ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
+    ip link show "eth0.$vid" >/dev/null 2>&1 || { say "VLAN $vid: no 802.1Q"; continue; }
+    ip link set "eth0.$vid" up 2>/dev/null
+    udhcpc -i "eth0.$vid" -n -q -t 4 -T 3 >/dev/null 2>&1
+    vline=$(ip addr show "eth0.$vid" 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' | head -1 | awk '{print $2}')
+    if [ -n "$vline" ]; then
+      vcidr=$(network_cidr "${vline%/*}" "${vline#*/}")
+      if [ "$vcidr" != "$ncidr" ]; then
+        VLAN_SUBNETS="$VLAN_SUBNETS ${vid}:${vcidr}"
+        "$cb" "eth0.$vid" "$vcidr" "vlan$vid"
+      fi
+    fi
+    ip link set "eth0.$vid" down 2>/dev/null
+    ip link del "eth0.$vid" 2>/dev/null
+  done
+}
+# ----------------------------------------------------------------------------
+
+# ------------------------------ PHASE: SETUP --------------------------------
+glow SETUP
+CLEAR_SCREEN 2>/dev/null
+say "Risky device hunt"
+if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"; REPORT="$RUN/summary.txt"
+ROWS="$RUN/_rows.tsv"; : > "$ROWS"
+
+
+# --------------------------- PHASE: NETWORK UP ------------------------------
+glow SPECIAL
+say "DHCP lease (eth0)"
+NETMODE DHCP_CLIENT 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
+# Bounded lease wait: WAIT_FOR_IP blocks forever, so keep our own timeout to fail
+# cleanly on a NAC'd / no-DHCP drop instead of running blind.
+IP=""; PREFIX=""
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}')
+  if [ -n "$line" ]; then IP=${line%/*}; PREFIX=${line#*/}; break; fi
+  sleep 1
+done
+if [ -z "$IP" ]; then
+  glow FAIL; say "No lease - 802.1X?"
+  echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
+  ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
+fi
+say "IP $IP/$PREFIX"
+
+
+# ----------------------- PHASE: DISCOVER + SCAN -----------------------------
+# Discover + fingerprint one (iface, cidr). Per-label raw files so the native
+# VLAN and each tagged VLAN accumulate into the same inventory.
+scan_one() {                                    # scan_one <iface> <cidr> <label>
+  local iface=$1 cidr=$2 label=$3 n OSFLAG=""
+  nmap -sn $NMAP_TIMING -e "$iface" -oG "$RUN/disc_$label.gnmap" "$cidr" >/dev/null 2>&1
+  awk '/Status: Up/{print $2}' "$RUN/disc_$label.gnmap" 2>/dev/null | sort -u > "$RUN/up_$label.txt"
+  n=$(wc -l < "$RUN/up_$label.txt" 2>/dev/null | tr -d ' '); [ -z "$n" ] && n=0
+  [ "$n" -eq 0 ] && return
+  say "$label: $n hosts"
+  [ "$OS_DETECT" = "1" ] && OSFLAG="-O --osscan-guess"
+  # shellcheck disable=SC2086
+  nmap -Pn $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" $OSFLAG -sV -p "$PORTSET" \
+    --script http-title -e "$iface" -iL "$RUN/up_$label.txt" -oN "$RUN/services_$label.txt" >/dev/null 2>&1
+  [ "$SNMP_LOOKUP" = "1" ] && nmap -Pn -sU $NMAP_TIMING --host-timeout 40s -p161 --script snmp-sysdescr \
+    -e "$iface" -iL "$RUN/up_$label.txt" -oN "$RUN/snmp_$label.txt" >/dev/null 2>&1
+}
+
+glow STAGE1
+say "Discovering + scanning"
+spin_up "Scan (native + tagged VLANs)"
+NATIVE_CIDR=$(network_cidr "$IP" "$PREFIX")
+run_over_vlans scan_one "$NATIVE_CIDR"
+spin_down
+
+# Merge per-VLAN raw output into the combined files the classifier expects.
+cat "$RUN"/services_*.txt > "$RUN/services.txt" 2>/dev/null
+cat "$RUN"/snmp_*.txt     > "$RUN/snmp.txt"     2>/dev/null
+cat "$RUN"/up_*.txt 2>/dev/null | sort -u > "$RUN/up.txt"
+UPCOUNT=$(wc -l < "$RUN/up.txt" 2>/dev/null | tr -d ' '); [ -z "$UPCOUNT" ] && UPCOUNT=0
+say "$UPCOUNT hosts up"
+if [ "$UPCOUNT" -eq 0 ]; then
+  glow FAIL; echo "No live hosts discovered on $IP/$PREFIX (any VLAN)." > "$REPORT"
+  ALERT "No hosts found" 8 2>/dev/null; exit 0
+fi
+
+# SNMP sysDescr (printer/switch make + firmware) -> ip<TAB>descr
+: > "$RUN/snmp_map.tsv"
+[ -s "$RUN/snmp.txt" ] && awk '
+  /^Nmap scan report for /{ip=$0; sub(/^Nmap scan report for /,"",ip); if(ip~/\(.*\)/){sub(/.*\(/,"",ip);sub(/\)/,"",ip)}}
+  /snmp-sysdescr:/{d=$0; sub(/.*snmp-sysdescr: */,"",d); gsub(/\t/," ",d); if(ip!="")print ip"\t"d}
+' "$RUN/snmp.txt" 2>/dev/null > "$RUN/snmp_map.tsv"
+
+
+# --------------------------- PHASE: CLASSIFY --------------------------------
+glow STAGE4
+say "Classifying devices"
+CREATE_PROGRESS_BAR "Classifying" 2>/dev/null
+
+# Parse services.txt into per-host records: IP HOST MAC VENDOR OS PORTNUMS PORTSVC BANNER
+awk '
+  function flush(  i){
+    if(ip=="")return
+    pn=""; ps=""
+    for(i=1;i<=np;i++){ pn=pn (pn==""?"":",") pport[i]; ps=ps (ps==""?"":" ") pport[i]"/"psvc[i] }
+    gsub(/\t/," ",ban)
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ip,host,mac,vendor,os,pn,ps,ban
+  }
+  /^Nmap scan report for /{ flush(); line=$0; sub(/^Nmap scan report for /,"",line)
+    if(line~/\(.*\)/){host=line;sub(/ \(.*/,"",host);ip=line;sub(/.*\(/,"",ip);sub(/\)/,"",ip)} else {host="-";ip=line}
+    mac="-";vendor="-";os="-";np=0;ban="" }
+  /^[0-9]+\/(tcp|udp)[ \t]+open/{ split($1,a,"/"); pport[++np]=a[1]; psvc[np]=$3
+    v=""; for(i=4;i<=NF;i++) v=v" "$i; ban=ban" " tolower($3 v) }
+  /^MAC Address: /{ mac=$3; vendor=$0; sub(/^MAC Address: [^ ]+ ?/,"",vendor); gsub(/^\(|\)$/,"",vendor); if(vendor=="")vendor="-"; ban=ban" " tolower(vendor) }
+  /^OS details:/{ os=$0; sub(/^OS details: /,"",os); ban=ban" " tolower($0) }
+  /^(Running|Aggressive OS guesses):/{ if(os=="-"){os=$0; sub(/^[^:]*: /,"",os)} ban=ban" " tolower($0) }
+  /http-title:/{ t=$0; sub(/.*http-title: */,"",t); ban=ban" " tolower(t) }
+  END{ flush() }
+' "$RUN/services.txt" 2>/dev/null > "$RUN/_hosts.tsv"
+
+TOTAL=$(wc -l < "$RUN/_hosts.tsv" 2>/dev/null | tr -d ' '); [ -z "$TOTAL" ] && TOTAL=0
+idx=0
+while IFS=$'\t' read -r hip hhost hmac hvend hos hpn hps hban; do
+  [ -z "$hip" ] && continue
+  idx=$((idx+1))
+  oui_lookup "$hmac"
+  # SNMP sysDescr enriches both the banner (classification) and the version.
+  SNMPD=$(awk -F'\t' -v ip="$hip" '$1==ip{print $2; exit}' "$RUN/snmp_map.tsv" 2>/dev/null)
+  LHAY="$hban $(echo "$SNMPD" | tr 'A-Z' 'a-z')"
+  # Manufacturer: real nmap vendor -> built-in OUI table -> banner/SNMP keyword guess.
+  MANU="$hvend"
+  if [ "$MANU" = "-" ] || [ "$MANU" = "Unknown" ]; then
+    if [ -n "$OUI_VENDOR" ]; then MANU="$OUI_VENDOR"
+    else g=$(guess_vendor "$LHAY"); [ -n "$g" ] && MANU="$g" || MANU="Unknown"; fi
+  fi
+  classify "$MANU" "$hos" "$hhost" "$hpn" "$LHAY"
+  # Version: OS details, else SNMP sysDescr, else "-".
+  VER="$hos"
+  if [ "$VER" = "-" ] || [ -z "$VER" ]; then VER="$SNMPD"; fi
+  [ -z "$VER" ] && VER="-"
+  VER=$(echo "$VER" | cut -c1-40)
+  DEVNAME="$CT"; [ "$hhost" != "-" ] && [ -n "$hhost" ] && DEVNAME="$CT ($hhost)"
+  PORTSDISP=$(echo "$hps" | cut -c1-46); [ -z "$PORTSDISP" ] && PORTSDISP="(none open)"
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    "$(risk_rank "$CR")" "$CR" "$DEVNAME" "${MANU:--}" "$VER" "$hip" "$PORTSDISP" "$CRE" >> "$ROWS"
+  [ "$TOTAL" -gt 0 ] && SET_PROGRESS $(( idx * 100 / TOTAL )) 2>/dev/null
+done < "$RUN/_hosts.tsv"
+SET_PROGRESS 100 2>/dev/null
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+glow CLEANUP
+say "Writing loot"
+FLAGGED=$(awk -F'\t' '$1<=3' "$ROWS" 2>/dev/null | wc -l | tr -d ' ')
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - ROGUE / RISKY DEVICE REPORT"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " From     : $IP/$PREFIX     Live hosts: $UPCOUNT     Flagged: $FLAGGED"
+  echo " VLANs    : native $(network_cidr "$IP" "$PREFIX")${VLAN_SUBNETS:+ ; tagged}${VLAN_SUBNETS}"
+  echo "            (host IPs identify their VLAN: e.g. .62.x = vlan3)"
+  echo ""
+  echo " RISK: HIGH = remove/verify now   MEDIUM = harden/patch   REVIEW = confirm owner"
+  echo ""
+  echo "##########################################################"
+  echo "#  FLAGGED FOR REVIEW (risky / unexpected)"
+  echo "##########################################################"
+  printf " %-6s  %-28s %-22s %-22s %-15s %s\n" "RISK" "DEVICE" "MANUFACTURER" "VERSION" "IP" "OPEN PORTS"
+  printf " %-6s  %-28s %-22s %-22s %-15s %s\n" "------" "----------------------------" "----------------------" "----------------------" "---------------" "----------"
+  sort -t"$(printf '\t')" -k1,1n "$ROWS" | awk -F'\t' '$1<=3{
+    printf " %-6s  %-28.28s %-22.22s %-22.22s %-15s %s\n", $2,$3,$4,$5,$6,$7
+  }'
+  echo ""
+  echo "   Why flagged:"
+  sort -t"$(printf '\t')" -k1,1n "$ROWS" | awk -F'\t' '$1<=3{printf "    %-15s %s - %s\n", $6, $3, $8}'
+  echo ""
+  echo "##########################################################"
+  echo "#  FULL INVENTORY (all live hosts)"
+  echo "##########################################################"
+  printf " %-6s  %-28s %-22s %-22s %-15s %s\n" "RISK" "DEVICE" "MANUFACTURER" "VERSION" "IP" "OPEN PORTS"
+  printf " %-6s  %-28s %-22s %-22s %-15s %s\n" "------" "----------------------------" "----------------------" "----------------------" "---------------" "----------"
+  sort -t"$(printf '\t')" -k1,1n "$ROWS" | awk -F'\t' '{
+    printf " %-6s  %-28.28s %-22.22s %-22.22s %-15s %s\n", $2,$3,$4,$5,$6,$7
+  }'
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " services.txt - combined nmap -sV -O output (all VLANs, per-host detail)"
+  echo " snmp.txt     - SNMP sysDescr (printer/switch firmware)"
+  echo " disc_*.gnmap services_*.txt - per-VLAN raw scans"
+  echo "=========================================================="
+} > "$REPORT"
+rm -f "$ROWS" "$RUN/_hosts.tsv" 2>/dev/null
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+glow FINISH
+CLEAR_SCREEN 2>/dev/null
+say "Risky hunt done"
+say "Flagged: $FLAGGED / $UPCOUNT"
+ALERT "Risky device scan done: $FLAGGED of $UPCOUNT hosts flagged for review." 12 2>/dev/null
+exit 0
