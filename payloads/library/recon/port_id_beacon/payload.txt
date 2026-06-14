@@ -5,6 +5,7 @@
 #  Target:      An unknown authorized wall jack you need to trace.
 #  Category:    recon (passive) / cable tracing
 #  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Plug into an unknown wall jack and read the switch and port off the OLED in

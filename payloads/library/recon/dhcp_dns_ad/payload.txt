@@ -5,6 +5,7 @@
 #  Target:      An authorized wired drop, scoping a new environment.
 #  Category:    recon
 #  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Answers "what kind of network is this?" in one pass:

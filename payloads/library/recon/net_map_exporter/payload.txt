@@ -5,6 +5,7 @@
 #  Target:      An authorized wired drop you want to diagram.
 #  Category:    recon / mapping / site-survey
 #  Version:     1.2
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Builds a field-observed topology map from one Shark Jack drop and exports

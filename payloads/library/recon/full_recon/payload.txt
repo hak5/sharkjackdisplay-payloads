@@ -5,7 +5,7 @@
 #  Target:      An authorized wired LAN reached via the RJ45 access port.
 #  Category:    recon
 #  Version:     1.0
-#  Firmware:    Shark Jack Display 1.0.1
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Plug into a wired drop, walk away, come back to a tidy loot report. In one

@@ -5,6 +5,7 @@
 #  Target:      An authorized wired drop; ideally a phone/data port or a trunk.
 #  Category:    recon (passive)
 #  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Passively inventories the VoIP and physical-security estate on the segment

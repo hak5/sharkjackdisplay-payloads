@@ -3,8 +3,9 @@
 #  Title:       Direct Host Profiler (Shark Jack Display)
 #  Author:      Brent Mills
 #  Target:      One unknown device, cabled directly to the Shark Jack.
-#  Category:    admin / device-identification / troubleshooting
+#  Category:    recon / admin / device-identification / troubleshooting
 #  Version:     1.2
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Answers "which physical device is HostXYZ?" when something on the network

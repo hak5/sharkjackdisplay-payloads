@@ -3,8 +3,9 @@
 #  Title:       Jack Survey / Drop Validator (Shark Jack Display)
 #  Author:      Brent Mills
 #  Target:      A single authorized wired wall jack / drop to validate.
-#  Category:    admin / site-survey / troubleshooting
+#  Category:    recon / admin / site-survey / troubleshooting
 #  Version:     1.1
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Validates one Ethernet wall jack end to end and answers the four

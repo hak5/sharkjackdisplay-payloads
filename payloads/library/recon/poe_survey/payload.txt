@@ -5,6 +5,7 @@
 #  Target:      An authorized wired drop you are evaluating for PoE.
 #  Category:    recon (passive)
 #  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Reports the Power-over-Ethernet posture of a drop by passively reading what
