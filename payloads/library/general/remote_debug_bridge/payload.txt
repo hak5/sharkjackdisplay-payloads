@@ -5,6 +5,7 @@
 #  Target:      An authorized wired drop you need to reach back into remotely.
 #  Category:    general / remote-access / troubleshooting
 #  Version:     1.1
+#  Firmware:    Tested on Shark Jack Display 1.0.1
 # ----------------------------------------------------------------------------
 #  WHAT IT DOES
 #    Turns the Shark Jack into a temporary remote-troubleshooting appliance, so
