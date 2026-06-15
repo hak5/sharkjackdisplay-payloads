@@ -39,7 +39,6 @@ LOOT_BASE="/root/loot/passive"
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -59,12 +58,12 @@ lldp_field() {
 
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Passive listen starting"
 
 if ! have tcpdump; then
-  glow FAIL
+  LED FAIL
   say "tcpdump missing"
   ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
   exit 1
@@ -81,7 +80,7 @@ WAIT_FOR_LINK 2>/dev/null            # don't start the capture before carrier is
 
 
 # ---------------------------- PHASE: LISTEN ---------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Listening ${LISTEN_SECS}s"
 CREATE_PROGRESS_BAR "Capturing traffic" 2>/dev/null
 # -p would disable promisc; we WANT promisc so multicast control frames arrive.
@@ -96,7 +95,7 @@ SET_PROGRESS 100 2>/dev/null
 
 
 # --------------------------- PHASE: DECODE ----------------------------------
-glow STAGE1
+LED STAGE1
 say "Decoding capture"
 
 # --- LLDP (0x88cc) and CDP (Cisco multicast 01:00:0c:cc:cc:cc) ---
@@ -145,7 +144,7 @@ spin_down
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 MDNSN=$(wc -l < "$RUN/mdns.txt" 2>/dev/null | tr -d ' '); [ -z "$MDNSN" ] && MDNSN=0
 {
@@ -196,7 +195,7 @@ MDNSN=$(wc -l < "$RUN/mdns.txt" 2>/dev/null | tr -d ' '); [ -z "$MDNSN" ] && MDN
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 NEIGH="${L_NAME:-$C_DEV}"
 CLEAR_SCREEN 2>/dev/null
 say "Passive listen done"

@@ -34,7 +34,6 @@ LOOT_BASE="/root/loot/port_id"
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -67,12 +66,12 @@ decode() {  # decode the current pcap into SWITCH/PORT (+ loot fields); sets glo
 
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Port ID Beacon"
 
 if ! have tcpdump; then
-  glow FAIL
+  LED FAIL
   say "tcpdump missing"
   ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
   exit 1
@@ -89,7 +88,7 @@ WAIT_FOR_LINK 2>/dev/null
 
 
 # ---------------------------- PHASE: LISTEN ---------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Listening for LLDP/CDP"
 spin_up "Waiting for a frame"
 
@@ -132,12 +131,12 @@ spin_down
 
 CLEAR_SCREEN 2>/dev/null
 if [ -n "$SWITCH" ] || [ -n "$PORT" ]; then
-  glow FINISH
+  LED FINISH
   say "Switch: ${SWITCH:-unknown}"
   say "Port: ${PORT:-unknown}"
   ALERT "Port ID: ${SWITCH:-?} ${PORT:-?}" 15 2>/dev/null
 else
-  glow FAIL
+  LED FAIL
   say "No LLDP/CDP heard"
   say "in ${WAIT_SECS}s"
   ALERT "No LLDP/CDP: unmanaged switch, or LLDP/CDP disabled" 12 2>/dev/null

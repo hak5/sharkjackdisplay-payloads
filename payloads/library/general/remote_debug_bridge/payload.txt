@@ -66,7 +66,6 @@ LOOT_BASE="/root/loot/debug_bridge"
 # ----------------------------------------------------------------------------
 
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Shared SSH options: key-only, pinned host key, dead-peer detection.
@@ -82,7 +81,7 @@ SSH_OPTS="-i $SSH_KEY -p $JUMP_PORT \
   -o UserKnownHostsFile=$KNOWN_HOSTS"
 
 # ------------------------------ SETUP ---------------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Remote Debug Bridge"
 
@@ -92,7 +91,7 @@ REPORT="$RUN/summary.txt"
 LOG="$RUN/bridge.log"
 
 fail() {  # fail <screen msg> <report reason>
-  glow FAIL
+  LED FAIL
   say "$1"
   echo "FAILED: $2" > "$REPORT"
   ALERT "$2" 8 2>/dev/null
@@ -107,7 +106,7 @@ have ssh || fail "ssh missing" "ssh client missing (opkg install openssh-client)
 chmod 600 "$SSH_KEY" 2>/dev/null
 
 # --------------------------- PHASE: NETWORK UP ------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Bringing up eth0 ($NET_MODE)"
 case "$NET_MODE" in
   STATIC) NETMODE STATIC IP_${STATIC_IP} SUBNET_${STATIC_SUBNET} GATEWAY_${STATIC_GATEWAY} 2>/dev/null ;;
@@ -129,7 +128,7 @@ ENABLE_NTP 2>/dev/null               # best-effort clock sync for honest timesta
 say "IP $IP/$PREFIX"
 
 # --------------------------- PHASE: REACHABILITY ----------------------------
-glow STAGE1
+LED STAGE1
 say "Testing jump reachability"
 if ! ping -c 1 -W 3 "$JUMP_HOST" >/dev/null 2>&1; then
   echo "$(date -u 2>/dev/null) ping to $JUMP_HOST failed (ICMP may be filtered); trying SSH anyway" >> "$LOG"
@@ -161,7 +160,7 @@ attempt=0
 fails=0
 while [ "$fails" -lt "$MAX_RETRIES" ]; do
   attempt=$((attempt + 1))
-  glow STAGE2
+  LED STAGE2
   say "Dial $((fails + 1))/$MAX_RETRIES"
 
   STAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
@@ -180,7 +179,7 @@ while [ "$fails" -lt "$MAX_RETRIES" ]; do
     continue
   fi
 
-  glow ATTACK
+  LED ATTACK
   say "Tunnel up"
   say "$REMOTE_BIND:$REMOTE_PORT"
 
@@ -204,7 +203,7 @@ while [ "$fails" -lt "$MAX_RETRIES" ]; do
 done
 
 # ------------------------------ PHASE: ENDED --------------------------------
-glow FAIL
+LED FAIL
 say "Bridge ended"
 say "$MAX_RETRIES fails"
 {

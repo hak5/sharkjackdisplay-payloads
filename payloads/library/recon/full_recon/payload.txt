@@ -79,9 +79,8 @@ network_cidr() {            # network_cidr <ip> <prefix> -> "net/prefix"
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Quiet wrappers so a missing display/LED binary never aborts the scan.
+# Quiet wrappers so a missing display binary never aborts the scan.
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }      # one line to the screen
-glow() { LED "$@" 2>/dev/null; }               # LED state/colour
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 
@@ -172,12 +171,12 @@ scan_subnet() {                                 # scan_subnet <iface> <cidr> <ba
 
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Wired recon starting"
 
 if ! have nmap; then
-  glow FAIL
+  LED FAIL
   say "nmap missing - abort"
   ALERT "nmap not installed on this device" 8 2>/dev/null
   exit 1
@@ -196,7 +195,7 @@ VLANF="$RUN/vlans.txt"
 
 
 # --------------------------- PHASE: NETWORK UP ------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Bringing up eth0 ($NET_MODE)"
 case "$NET_MODE" in
   STATIC) NETMODE STATIC IP_${STATIC_IP} SUBNET_${STATIC_SUBNET} GATEWAY_${STATIC_GATEWAY} 2>/dev/null ;;
@@ -217,7 +216,7 @@ for i in $(seq 1 "$DHCP_WAIT_SECS"); do
 done
 
 if [ -z "$IP" ]; then
-  glow FAIL
+  LED FAIL
   say "No lease on eth0"
   say "NAC / 802.1X? dead port?"
   { echo "FAILED: no IPv4 on eth0 after ${DHCP_WAIT_SECS}s (NET_MODE=$NET_MODE)."
@@ -236,7 +235,7 @@ ENABLE_NTP 2>/dev/null
 
 
 # --------------------------- PHASE: ROUTER ----------------------------------
-glow STAGE1
+LED STAGE1
 say "Profiling gateway"
 ROUTER_OS="-"
 if [ -n "$GATEWAY" ]; then
@@ -256,7 +255,7 @@ fi
 
 
 # ----------------------- PHASE: HOST DISCOVERY ------------------------------
-glow STAGE2
+LED STAGE2
 say "Discovering hosts"
 spin_up "ARP/ping sweep $ACCESS_CIDR"
 # On a local segment, nmap uses ARP for discovery: reliable even when ICMP is
@@ -270,7 +269,7 @@ say "$UPCOUNT hosts up"
 
 
 # --------------------- PHASE: SERVICE / PORT SCAN ---------------------------
-glow STAGE3
+LED STAGE3
 if [ "$UPCOUNT" -gt 0 ]; then
   spin_up "Port/service scan x$UPCOUNT"
   nmap -sV $NMAP_TIMING --top-ports "$TOP_PORTS" --host-timeout "$HOST_TIMEOUT" \
@@ -285,7 +284,7 @@ parse_services "$RUN/services.nmap"
 
 
 # --------------------------- PHASE: VLANs -----------------------------------
-glow STAGE4
+LED STAGE4
 say "Mapping VLANs"
 {
   echo "Access subnet (untagged): $ACCESS_CIDR   [our lease: $IP/$PREFIX]"
@@ -321,7 +320,7 @@ if [ "$SCAN_TAGGED_VLANS" = "1" ]; then
     lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null   # ensure 802.1Q support
     echo "Tagged-VLAN scan (VIDs: $CANDIDATES):" >> "$VLANF"
     for vid in $CANDIDATES; do
-      glow STAGE5
+      LED STAGE5
       spin_up "VLAN $vid: lease + scan"
       ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
       if ! ip link show "eth0.$vid" >/dev/null 2>&1; then
@@ -356,7 +355,7 @@ fi
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 # Total live hosts across the native VLAN + any scanned tagged VLANs.
 UPCOUNT=$(wc -l < "$HOSTSF" 2>/dev/null | tr -d ' '); [ -z "$UPCOUNT" ] && UPCOUNT=0
@@ -435,7 +434,7 @@ rm -f "$HOSTSF" "$PORTSF" "$RUN/_tags.txt" "$RUN"/vlan*_up.txt 2>/dev/null
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 PORTLINES=$(grep -cE '^    [0-9]+/(tcp|udp)' "$REPORT" 2>/dev/null)
 [ -z "$PORTLINES" ] && PORTLINES=0
 CLEAR_SCREEN 2>/dev/null

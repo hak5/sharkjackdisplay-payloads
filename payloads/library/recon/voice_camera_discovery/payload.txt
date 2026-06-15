@@ -41,7 +41,6 @@ LOOT_BASE="/root/loot/voice_camera"
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -87,12 +86,12 @@ oui_class() {
 
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Voice & Camera Discovery"
 
 if ! have tcpdump; then
-  glow FAIL
+  LED FAIL
   say "tcpdump missing"
   ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
   exit 1
@@ -109,7 +108,7 @@ WAIT_FOR_LINK 2>/dev/null            # don't start the capture before carrier is
 
 
 # ---------------------------- PHASE: LISTEN ---------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Listening ${LISTEN_SECS}s"
 CREATE_PROGRESS_BAR "Capturing traffic" 2>/dev/null
 # Promisc left ON (no -p) so multicast control/discovery frames arrive.
@@ -124,7 +123,7 @@ SET_PROGRESS 100 2>/dev/null
 
 
 # --------------------------- PHASE: DECODE ----------------------------------
-glow STAGE1
+LED STAGE1
 say "Decoding capture"
 
 # --- Switch neighbors: LLDP (0x88cc) + CDP (Cisco multicast) ---
@@ -187,7 +186,7 @@ spin_down
 
 
 # --------------------------- PHASE: CLASSIFY --------------------------------
-glow STAGE2
+LED STAGE2
 say "Classifying devices"
 
 mac_for() { awk -F'\t' -v ip="$1" '$1==ip{print $2; exit}' "$RUN/arp_hosts.tsv" 2>/dev/null; }
@@ -233,7 +232,7 @@ VOICE_SUMMARY="$VOICE_VLAN_LLDP"
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 {
   echo "=========================================================="
@@ -295,7 +294,7 @@ say "Writing loot"
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 CLEAR_SCREEN 2>/dev/null
 say "Voice/Camera done"
 say "Phones: $NPHONE"

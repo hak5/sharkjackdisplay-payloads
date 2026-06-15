@@ -46,7 +46,6 @@ PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -103,16 +102,16 @@ run_over_vlans() {                              # run_over_vlans <cb> <native_ne
 # ----------------------------------------------------------------------------
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Segmentation + egress"
-if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+if ! have nmap; then LED FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
 RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
 mkdir -p "$RUN"; REPORT="$RUN/summary.txt"
 
 
 # --------------------------- PHASE: NETWORK UP ------------------------------
-glow SPECIAL
+LED SPECIAL
 say "DHCP lease (eth0)"
 NETMODE DHCP_CLIENT 2>/dev/null
 WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
@@ -125,7 +124,7 @@ for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
   sleep 1
 done
 if [ -z "$IP" ]; then
-  glow FAIL; say "No lease - 802.1X?"
+  LED FAIL; say "No lease - 802.1X?"
   echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
   ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
 fi
@@ -134,7 +133,7 @@ say "IP $IP/$PREFIX"
 
 
 # ----------------------------- PHASE: EGRESS --------------------------------
-glow STAGE1
+LED STAGE1
 say "Testing egress"
 spin_up "Outbound TCP -> $EXT_IP"
 nmap -Pn --reason -T4 -p "$EGRESS_PORTS" "$EXT_IP" -oN "$RUN/egress_tcp.txt" >/dev/null 2>&1
@@ -149,7 +148,7 @@ UDP53=$(awk '/^53\/udp/{print ($2=="open"||$2=="open|filtered")?"allowed":"block
 
 
 # -------------------------- PHASE: INTERNET PATH ----------------------------
-glow STAGE2
+LED STAGE2
 say "Internet path"
 spin_up "HTTP/TLS path"
 BODY=""
@@ -170,7 +169,7 @@ spin_down
 
 
 # ------------------------- PHASE: GW MGMT + SEGMENTATION --------------------
-glow STAGE3
+LED STAGE3
 say "Gateway mgmt"
 spin_up "Gateway admin ports"
 nmap -Pn -T4 -p22,23,80,443,8443 "$GATEWAY" -oN "$RUN/gateway_mgmt.txt" >/dev/null 2>&1
@@ -179,7 +178,7 @@ GW_OPEN=$(awk '/^[0-9]+\/tcp[ \t]+open/{split($1,a,"/"); printf "%s/%s ", a[1], 
 
 SEG_RESULT="not tested (SEG_TARGETS empty)"
 if [ -n "$SEG_TARGETS" ]; then
-  glow STAGE4
+  LED STAGE4
   say "Segmentation probe"
   spin_up "Reaching SEG_TARGETS"
   # shellcheck disable=SC2086
@@ -213,14 +212,14 @@ scan_one() {                                    # scan_one <iface> <cidr> <label
   } >> "$RUN/vlan_egress.txt"
 }
 if [ "$SCAN_TAGGED_VLANS" = "1" ]; then
-  glow STAGE5
+  LED STAGE5
   say "Per-VLAN egress"
   run_over_vlans scan_one "$(network_cidr "$IP" "$PREFIX")"
 fi
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 {
   echo "=========================================================="
@@ -257,7 +256,7 @@ say "Writing loot"
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 CLEAR_SCREEN 2>/dev/null
 say "Seg/egress done"
 say "Egress: ${EG_ALLOW:-none}"

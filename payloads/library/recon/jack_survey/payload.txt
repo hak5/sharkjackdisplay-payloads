@@ -56,7 +56,6 @@ VLAN_DHCP_WAIT=6               # per-VLAN DHCP timeout (s) during the reach prob
 # ----------------------------------------------------------------------------
 
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
@@ -117,7 +116,7 @@ record_check() {
 }
 
 # ------------------------------ SETUP ---------------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Jack Survey"
 say "Waiting for link"
@@ -130,7 +129,7 @@ REPORT="$RUN/summary.txt"
 ip link set eth0 up 2>/dev/null
 
 # ------------------------------ LINK ----------------------------------------
-glow SPECIAL
+LED SPECIAL
 LINK="DOWN"
 
 for _ in $(seq 1 "$LINK_WAIT_SECS"); do
@@ -165,7 +164,7 @@ if [ -n "$EXPECTED_DUPLEX" ] && [ -n "$DUPLEX" ]; then
 fi
 
 if [ "$LINK" != "UP" ]; then
-  glow FAIL
+  LED FAIL
   say "Link: DOWN"
   say "No carrier"
 
@@ -200,7 +199,7 @@ C_DEV="-"; C_PLAT="-"; C_PORT="-"; C_NVLAN="-"; C_ADDR="-"
 DHCP_SRV_SEEN="-"; STP_SEEN="not seen"; ARPN=0
 
 if have tcpdump; then
-  glow STAGE1
+  LED STAGE1
   say "Passive discovery"
   spin_up "LLDP/CDP/DHCP"
 
@@ -259,7 +258,7 @@ MGMT="${L_MGMT:-$C_ADDR}"
 [ -n "$OBS_VLAN" ] && [ "$OBS_VLAN" != "-" ] && record_check "PASS" "VLAN advertised" "$OBS_VLAN" || record_check "INFO" "VLAN advertised" "not advertised"
 
 # ------------------------------- DHCP ---------------------------------------
-glow STAGE2
+LED STAGE2
 say "DHCP request"
 NETMODE DHCP_CLIENT 2>/dev/null
 WAIT_FOR_LINK 2>/dev/null
@@ -354,7 +353,7 @@ HTTPS_RESULT="not tested"
 HTTP_RESULT="not tested"
 
 if [ -n "$IP" ]; then
-  glow STAGE3
+  LED STAGE3
   say "Internet tests"
 
   if have nslookup; then
@@ -411,7 +410,7 @@ else
 fi
 
 if [ "$PROBE_VLAN_REACH" = "1" ]; then
-  glow STAGE4
+  LED STAGE4
   say "VLAN reach probe"
   if have ip && have udhcpc; then
     spin_up "Tagging VLANs (no scan)"
@@ -499,7 +498,7 @@ else
 fi
 
 # ------------------------------ REPORT --------------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing report"
 
 {
@@ -602,9 +601,9 @@ say "Writing report"
 CLEAR_SCREEN 2>/dev/null
 
 case "$RESULT" in
-  PASS|PASS\ WITH\ NOTES) glow FINISH ;;
-  LIMITED|MISPATCH\ SUSPECTED) glow SPECIAL ;;
-  *) glow FAIL ;;
+  PASS|PASS\ WITH\ NOTES) LED FINISH ;;
+  LIMITED|MISPATCH\ SUSPECTED) LED SPECIAL ;;
+  *) LED FAIL ;;
 esac
 
 say "Jack: $RESULT"

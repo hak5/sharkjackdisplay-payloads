@@ -41,7 +41,6 @@ LOOT_BASE="/root/loot/direct_host"
 # ----------------------------------------------------------------------------
 
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
@@ -81,7 +80,7 @@ guess_type() {
 }
 
 # ------------------------------ SETUP ---------------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Direct Host Profiler"
 say "Connect target device"
@@ -91,7 +90,7 @@ mkdir -p "$RUN"
 REPORT="$RUN/summary.txt"
 
 if ! have nmap; then
-  glow FAIL
+  LED FAIL
   say "nmap missing"
   echo "FAILED: nmap missing" > "$REPORT"
   ALERT "nmap missing" 8 2>/dev/null
@@ -99,7 +98,7 @@ if ! have nmap; then
 fi
 
 # ------------------------------ LINK ----------------------------------------
-glow SPECIAL
+LED SPECIAL
 ip link set eth0 up 2>/dev/null
 
 LINK="DOWN"
@@ -113,7 +112,7 @@ SPEED=$(get_speed)
 DUPLEX=$(get_duplex)
 
 if [ "$LINK" != "UP" ]; then
-  glow FAIL
+  LED FAIL
   say "Link: DOWN"
   {
     echo "=========================================================="
@@ -130,7 +129,7 @@ fi
 say "Link: ${SPEED:-?} ${DUPLEX:-?}"
 
 # --------------------------- DHCP SERVER ------------------------------------
-glow STAGE1
+LED STAGE1
 say "Starting DHCP server"
 
 # Start the passive capture FIRST so the DHCP handshake (hostname, vendor class,
@@ -159,7 +158,7 @@ done
 [ -z "$SJ_IP" ] && SJ_IP="-"
 
 # --------------------------- WAIT FOR CLIENT --------------------------------
-glow STAGE2
+LED STAGE2
 say "Waiting for client"
 
 CLIENT_IP=""
@@ -194,7 +193,7 @@ if [ -z "$CLIENT_IP" ] && [ -s "$PCAP" ]; then
 fi
 
 if [ -z "$CLIENT_IP" ]; then
-  glow FAIL
+  LED FAIL
   say "No DHCP client"
   {
     echo "=========================================================="
@@ -247,7 +246,7 @@ MDNS_NAMES=$(tr '\n' ' ' < "$RUN/mdns_names.txt" 2>/dev/null)
 [ -z "$CLIENT_MAC" ] && CLIENT_MAC="$DHCP_MAC"
 
 # ------------------------------- SCAN HOST ----------------------------------
-glow STAGE3
+LED STAGE3
 say "Profiling host"
 spin_up "Scanning $CLIENT_IP"
 
@@ -291,7 +290,7 @@ DEVICE_NAME="$DHCP_HOSTNAME"
 DEVICE_TYPE=$(guess_type "$VENDOR $DHCP_VENDOR" "$OS_GUESS" "$DEVICE_NAME $NETBIOS_NAME" "$MDNS_NAMES" "$OPEN_PORT_NUMS")
 
 # ------------------------------- REPORT -------------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing report"
 
 {
@@ -347,7 +346,7 @@ say "Writing report"
 } > "$REPORT"
 
 # ------------------------------- DISPLAY ------------------------------------
-glow FINISH
+LED FINISH
 CLEAR_SCREEN 2>/dev/null
 say "Direct Host: DONE"
 say "IP: ${CLIENT_IP:--}"

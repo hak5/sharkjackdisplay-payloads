@@ -41,7 +41,6 @@ LOOT_BASE="/root/loot/poe_survey"
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -72,12 +71,12 @@ class_power() {
 
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "PoE Survey"
 
 if ! have tcpdump; then
-  glow FAIL
+  LED FAIL
   say "tcpdump missing"
   ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
   exit 1
@@ -94,7 +93,7 @@ WAIT_FOR_LINK 2>/dev/null
 
 
 # ---------------------------- PHASE: LISTEN ---------------------------------
-glow SPECIAL
+LED SPECIAL
 say "Listening ${LISTEN_SECS}s"
 CREATE_PROGRESS_BAR "Capturing LLDP/CDP" 2>/dev/null
 tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null &
@@ -108,7 +107,7 @@ SET_PROGRESS 100 2>/dev/null
 
 
 # --------------------------- PHASE: DECODE ----------------------------------
-glow STAGE1
+LED STAGE1
 say "Reading power TLVs"
 spin_up "LLDP / CDP power"
 
@@ -175,7 +174,7 @@ fi
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 spin_down
 {
@@ -227,7 +226,7 @@ spin_down
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow "$VLED"
+LED "$VLED"
 CLEAR_SCREEN 2>/dev/null
 say "PoE: $VERDICT"
 [ "$VERDICT" = "PoE AVAILABLE" ] && say "Class: ${POE_CLASS:--}"

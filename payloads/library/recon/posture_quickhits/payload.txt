@@ -42,7 +42,6 @@ PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -114,16 +113,16 @@ run_over_vlans() {                              # run_over_vlans <cb> <native_ne
 # ----------------------------------------------------------------------------
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "Posture quick-hits"
-if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+if ! have nmap; then LED FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
 RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
 mkdir -p "$RUN"; REPORT="$RUN/summary.txt"
 
 
 # --------------------------- PHASE: NETWORK UP ------------------------------
-glow SPECIAL
+LED SPECIAL
 say "DHCP lease (eth0)"
 NETMODE DHCP_CLIENT 2>/dev/null
 WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
@@ -136,7 +135,7 @@ for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
   sleep 1
 done
 if [ -z "$IP" ]; then
-  glow FAIL; say "No lease - 802.1X?"
+  LED FAIL; say "No lease - 802.1X?"
   echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
   ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
 fi
@@ -165,7 +164,7 @@ scan_one() {                                    # scan_one <iface> <cidr> <label
     --script ssl-cert,ssl-enum-ciphers -iL "$L" -oN "$RUN/tls_$label.txt" >/dev/null 2>&1
 }
 
-glow STAGE1
+LED STAGE1
 say "Scanning (native + tagged VLANs)"
 spin_up "Posture scan"
 NATIVE_CIDR=$(network_cidr "$IP" "$PREFIX")
@@ -181,13 +180,13 @@ cat "$RUN"/up_*.txt 2>/dev/null | sort -u > "$RUN/up.txt"
 UPCOUNT=$(wc -l < "$RUN/up.txt" 2>/dev/null | tr -d ' '); [ -z "$UPCOUNT" ] && UPCOUNT=0
 say "$UPCOUNT hosts up"
 if [ "$UPCOUNT" -eq 0 ]; then
-  glow FAIL; echo "No live hosts discovered on $IP/$PREFIX (any VLAN)." > "$REPORT"
+  LED FAIL; echo "No live hosts discovered on $IP/$PREFIX (any VLAN)." > "$REPORT"
   ALERT "No hosts found" 8 2>/dev/null; exit 0
 fi
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Scoring findings"
 {
   echo "=========================================================="
@@ -225,7 +224,7 @@ if [ "$NFIND" -eq 0 ]; then echo " No quick-hit findings (clean on the checks ru
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 CLEAR_SCREEN 2>/dev/null
 say "Posture scan done"
 say "Findings: $NFIND"

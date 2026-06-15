@@ -40,7 +40,6 @@ PASSIVE_VLAN_SECS=12          # passive 802.1Q listen window (needs tcpdump)
 
 # ============================ helpers =======================================
 say()  { SCREEN_WRITE "$*" 2>/dev/null; }
-glow() { LED "$@" 2>/dev/null; }
 spin_up()   { CREATE_SPINNER "$*" 2>/dev/null; }
 spin_down() { STOP_SPINNER 2>/dev/null; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -98,10 +97,10 @@ run_over_vlans() {                              # run_over_vlans <cb> <native_ne
 # ----------------------------------------------------------------------------
 
 # ------------------------------ PHASE: SETUP --------------------------------
-glow SETUP
+LED SETUP
 CLEAR_SCREEN 2>/dev/null
 say "DHCP/DNS/AD profiler"
-if ! have nmap; then glow FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
+if ! have nmap; then LED FAIL; say "nmap missing - abort"; ALERT "nmap not installed" 8 2>/dev/null; exit 1; fi
 
 RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
 mkdir -p "$RUN"
@@ -109,7 +108,7 @@ REPORT="$RUN/summary.txt"
 
 
 # --------------------------- PHASE: NETWORK UP ------------------------------
-glow SPECIAL
+LED SPECIAL
 say "DHCP lease (eth0)"
 NETMODE DHCP_CLIENT 2>/dev/null
 WAIT_FOR_LINK 2>/dev/null            # framework: block until carrier is up (the race fix)
@@ -122,7 +121,7 @@ for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
   sleep 1
 done
 if [ -z "$IP" ]; then
-  glow FAIL; say "No lease - 802.1X?"
+  LED FAIL; say "No lease - 802.1X?"
   echo "FAILED: no DHCP lease on eth0 (NAC/802.1X, no DHCP, or dead drop)." > "$REPORT"
   ALERT "No DHCP lease - see loot" 8 2>/dev/null; exit 1
 fi
@@ -131,7 +130,7 @@ say "IP $IP/$PREFIX"
 
 
 # --------------------------- PHASE: DHCP PROFILE ----------------------------
-glow STAGE1
+LED STAGE1
 say "Profiling DHCP"
 spin_up "DHCP discover"
 nmap --script broadcast-dhcp-discover -e eth0 2>/dev/null > "$RUN/dhcp.txt"
@@ -151,7 +150,7 @@ DNS1=$(echo "$DNS" | awk '{print $1}')
 
 
 # --------------------------- PHASE: DNS / AD --------------------------------
-glow STAGE2
+LED STAGE2
 DCS="-"; ZONE="not attempted"; RECUR="-"; PTRN=0
 if [ -n "$DOMAIN" ]; then
   say "AD lookup: $DOMAIN"
@@ -218,14 +217,14 @@ scan_one() {                                    # scan_one <iface> <cidr> <label
   } >> "$RUN/vlan_profiles.txt"
 }
 if [ "$SCAN_TAGGED_VLANS" = "1" ]; then
-  glow STAGE3
+  LED STAGE3
   say "Per-VLAN profiles"
   run_over_vlans scan_one "$(network_cidr "$IP" "$PREFIX")"
 fi
 
 
 # --------------------------- PHASE: WRITE LOOT ------------------------------
-glow CLEANUP
+LED CLEANUP
 say "Writing loot"
 {
   echo "=========================================================="
@@ -267,7 +266,7 @@ say "Writing loot"
 
 
 # ------------------------------ PHASE: DONE ---------------------------------
-glow FINISH
+LED FINISH
 CLEAR_SCREEN 2>/dev/null
 say "Profile complete"
 say "Domain: ${DOMAIN:-none}"
