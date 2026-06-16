@@ -3,7 +3,7 @@
 # Title: Network Pregnancy Test
 # Description: Humorous network diagnostic simulator using LLDP/CDP checks and randomized results
 # Author: Reda
-# Props: Cribbit, Hackazillarex, Virtual Private Coffee, Hak5Darren, 
+# Props: Cribbit, Hackazillarex, Virtual Private Coffee, Hak5Darren, jader242, The Hak5 Team
 
 
 # Configuration
