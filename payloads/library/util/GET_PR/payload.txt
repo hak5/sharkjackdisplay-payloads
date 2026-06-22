@@ -1,0 +1,93 @@
+#!/bin/bash
+# Title: Get PR
+# Author: Hak5Darren
+# Description: Installs payload.txt for the specified PR number from the Hak5 Shark Jack Display github repo. Only supports PRs with singular payload.txt files (best practice)
+OWNER="hak5"
+REPO="sharkjackdisplay-payloads"
+BASE_DIR="/root/library/pr"
+
+RESP="$(SINGLE_NUMBER_PICKER "Pull Request?" "1")"
+if [ "$RESP" = "← Back" ]; then
+  SCREEN_WRITE "Cancelled"
+  exit
+fi
+PR=$RESP
+SCREEN_WRITE "Checking PR $PR"
+
+SCREEN_WRITE "Getting Online"
+NETMODE DHCP_CLIENT
+WAIT_FOR_LINK
+SCREEN_WRITE "Syncing Time"
+SYNC_TIME
+
+WORK_DIR="/tmp/get_pr_$PR"
+TAR_FILE="$WORK_DIR/pr_$PR.tar.gz"          
+UNTAR_DIR="/tmp/got_pr_$PR"            
+ARCHIVE_URL="https://codeload.github.com/$OWNER/$REPO/tar.gz/refs/pull/$PR/head"
+FILES_URL="https://api.github.com/repos/$OWNER/$REPO/pulls/$PR/files?per_page=100"
+mkdir -p "$WORK_DIR"
+mkdir -p "$UNTAR_DIR" 
+
+
+if ! wget -qO- "$FILES_URL" | sed -n 's/.*"filename": "\([^"]*\)".*/\1/p' > "$WORK_DIR/changed_files.txt"; then
+  SCREEN_WRITE "Download Failed"
+  SCREEN_WRITE "$FILES_URL"
+  rm -rf "$WORK_DIR"
+  rm -rf "$UNTAR_DIR"
+  exit 1
+fi
+
+PAYLOAD_COUNT="$(grep -c '/payload.txt$' "$WORK_DIR/changed_files.txt")"
+if [ "$PAYLOAD_COUNT" -gt 1 ]; then
+  SCREEN_WRITE "Error: PR $PR"
+  SCREEN_WRITE "has multiple"
+  SCREEN_WRITE "payload files"
+  rm -rf "$WORK_DIR"
+  rm -rf "$UNTAR_DIR"
+  exit 1
+fi
+
+PAYLOAD_NAME="$(cat $WORK_DIR/changed_files.txt | grep payload.txt | awk -F '/' '{print $4}')"
+PAYLOAD_FILE="$(cat $WORK_DIR/changed_files.txt | grep payload.txt)"
+mkdir -p "$BASE_DIR/$PAYLOAD_NAME"
+SCREEN_WRITE "Found payload:"
+SCREEN_WRITE "$PAYLOAD_NAME"
+
+if ! wget -O "$TAR_FILE" "$ARCHIVE_URL"; then
+  SCREEN_WRITE "PR Fetch Failed"
+  SCREEN_WRITE "$ARCHIVE_URL"
+  rm -rf "$WORK_DIR"
+  rm -rf "$UNTAR_DIR"
+  exit 1
+fi
+
+SCREEN_WRITE "Got payload!"
+SCREEN_WRITE "Extracting..."
+
+if ! tar -xzf "$TAR_FILE" -C "$UNTAR_DIR"; then
+  SCREEN_WRITE "Extract Failed"
+  rm -rf "$WORK_DIR"
+  rm -rf "$UNTAR_DIR"
+  exit 1
+fi
+
+SCREEN_WRITE "Moving Payload"
+mkdir -p "$BASE_DIR/$PAYLOAD_NAME"
+TOP_DIR="$(find "$UNTAR_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+
+if ! cp "$TOP_DIR/$PAYLOAD_FILE" "$BASE_DIR/$PAYLOAD_NAME"; then
+  SCREEN_WRITE "Move Failed"
+  SCREEN_WRITE "From:"
+  SCREEN_WRITE "$UNTAR_DIR/sharkjackdisplay-payloads-refs-pull-$PR-head/$PAYLOAD_FILE"
+  SCREEN_WRITE "To:"
+  SCREEN_WRITE "$BASE_DIR/$PAYLOAD_NAME"
+  rm -rf "$WORK_DIR"
+  rm -rf "$UNTAR_DIR"
+  rm -rf "$BASE_DIR/$PAYLOAD_NAME"
+  exit 1
+fi
+
+rm -rf "$WORK_DIR"
+rm -rf "$UNTAR_DIR"
+SCREEN_WRITE "Installed $PR"
+SCREEN_WRITE "$PAYLOAD_NAME"
