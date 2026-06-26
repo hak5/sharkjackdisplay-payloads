@@ -1,0 +1,527 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Network Map Exporter (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop you want to diagram.
+#  Category:    recon / mapping / site-survey
+#  Version:     1.2
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Builds a field-observed topology map from one Shark Jack drop and exports
+#    it in formats you can drop straight into a deliverable:
+#      - Passive LLDP/CDP/ARP .. switch, the port you are in, VLAN, mgmt IP.
+#      - DHCP .................. our lease, subnet CIDR, gateway, DNS.
+#      - Active discovery ...... nmap host sweep of the access subnet, then a
+#                                top-ports service sample of the live hosts.
+#      - VLAN traversal ........ (opt-in) passively sniff 802.1Q tags, then for
+#                                each tagged VLAN bring up eth0.<vid>, pull DHCP,
+#                                discover + scan that subnet, and fold its hosts
+#                                into the map labeled by VLAN/subnet.
+#      - Exports ............... topology.json (generic graph), topology.mmd
+#                                (Mermaid), topology.dot (Graphviz), summary.txt.
+#
+#  AUTHORIZATION
+#    This payload is ACTIVE: it pulls a DHCP lease and runs nmap. With
+#    SCAN_TAGGED_VLANS=1 it also tags onto other VLANs (active VLAN-hopping).
+#    Run ONLY on networks you own or are contracted to assess, within the agreed
+#    scope and time window. Output stays on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+DHCP_WAIT_SECS=30
+PASSIVE_LISTEN_SECS=75
+TOP_PORTS=100
+NMAP_TIMING="-T4"
+HOST_TIMEOUT="60s"
+
+# VLAN traversal: discover + scan tagged VLANs and fold their hosts into the map.
+PASSIVE_VLAN_SECS=15          # passive 802.1Q listen window (needs tcpdump)
+SCAN_TAGGED_VLANS=0           # 1 = bring up eth0.<vid>, DHCP, discover+scan each
+                              #     tagged VLAN. ACTIVE VLAN-hopping; authorized
+                              #     engagements only. No-op on a plain access port.
+VLAN_PROBE_IDS=""             # fallback VIDs if none are sniffed, e.g. "10 20 30"
+
+LOOT_BASE="/root/loot/network_map"
+# ----------------------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+safe_id() {
+  echo "$1" | sed 's/[^A-Za-z0-9_]/_/g'
+}
+
+json_escape() {
+  echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# Sanitize free text for graph LABELS (node IDs use safe_id; these are the
+# visible strings). Switch descriptions/hostnames carry quotes, commas, and
+# parens that break the diagram formats, so scrub per-format before embedding.
+# Newlines are stripped; the per-format line breaks (<br/> or \n) are added by
+# the emitter, not by these values.
+mmd_txt() { printf '%s' "$1" | tr -d '\r\n' | tr '"' "'"; }            # Mermaid quoted label
+dot_txt() { printf '%s' "$1" | tr -d '\r\n' | sed 's/\\/\\\\/g; s/"/\\"/g'; }  # Graphviz label
+
+ip_to_int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
+int_to_ip() { local i=$1; echo "$(((i>>24)&255)).$(((i>>16)&255)).$(((i>>8)&255)).$((i&255))"; }
+mask_for()  { local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_cidr() {
+  local ip=$1 p=$2 m
+  [ -z "$ip" ] || [ -z "$p" ] && return
+  m=$(mask_for "$p")
+  echo "$(int_to_ip $(( $(ip_to_int "$ip") & m )))/$p"
+}
+
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val)
+      sub(/^Subtype[^:]*: /,"",val)
+      print val
+      exit
+    }' "$1" 2>/dev/null
+}
+
+# Parse one nmap -sV normal-output file and APPEND host rows to hosts.tsv, each
+# tagged with the segment (subnet CIDR) it belongs to. Columns:
+#   ip \t hostname \t mac \t vendor \t ports \t segment_cidr
+parse_seg() {                                    # parse_seg <services.nmap> <seg_cidr>
+  awk -v seg="$2" '
+    function flush() {
+      if (ip=="") return
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", ip, host, mac, vendor, ports, seg
+    }
+    /^Nmap scan report for / {
+      flush()
+      line=$0; sub(/^Nmap scan report for /,"",line)
+      if (line ~ /\(.*\)/) { host=line; sub(/ \(.*/,"",host); ip=line; sub(/.*\(/,"",ip); sub(/\)/,"",ip) }
+      else { host="-"; ip=line }
+      mac="-"; vendor="-"; ports=""
+    }
+    /^[0-9]+\/tcp[ \t]+open/ { split($1,a,"/"); ports=ports (ports==""?"":",") a[1] "/" $3 }
+    /^MAC Address: / {
+      mac=$3; vendor=$0
+      sub(/^MAC Address: [^ ]+ ?/,"",vendor); gsub(/^\(|\)$/,"",vendor)
+      if (vendor=="") vendor="-"
+    }
+    END { flush() }
+  ' "$1" 2>/dev/null >> "$RUN/hosts.tsv"
+}
+
+# Discover + service-scan a subnet through a given interface, folding the parsed
+# hosts (labeled with seg) into hosts.tsv. Echoes the live-host count.
+scan_segment() {                                 # scan_segment <iface> <target> <base> <seg_cidr>
+  local iface=$1 target=$2 base=$3 seg=$4 n=0
+  nmap -sn $NMAP_TIMING -e "$iface" -oG "$base.discovery.gnmap" "$target" >/dev/null 2>&1
+  awk '/Status: Up/{print $2}' "$base.discovery.gnmap" 2>/dev/null | sort -u > "$base.up.txt"
+  n=$(wc -l < "$base.up.txt" 2>/dev/null | tr -d ' '); [ -z "$n" ] && n=0
+  if [ "$n" -gt 0 ]; then
+    nmap -sV $NMAP_TIMING --top-ports "$TOP_PORTS" --host-timeout "$HOST_TIMEOUT" \
+      -e "$iface" -iL "$base.up.txt" -oN "$base.services.nmap" -oX "$base.services.xml" >/dev/null 2>&1
+    parse_seg "$base.services.nmap" "$seg"
+  fi
+  echo "$n"
+}
+
+# ------------------------------ SETUP ---------------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Network Map Exporter"
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+JSON="$RUN/topology.json"
+MMD="$RUN/topology.mmd"
+DOT="$RUN/topology.dot"
+
+if ! have nmap; then
+  LED FAIL
+  SCREEN_WRITE "nmap missing"
+  echo "FAILED: nmap missing" > "$REPORT"
+  ALERT "nmap missing" 8 2>/dev/null
+  exit 1
+fi
+
+# --------------------------- PASSIVE LISTEN ---------------------------------
+LED SPECIAL
+SCREEN_WRITE "Passive listen"
+ip link set eth0 up 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null
+
+PCAP="$RUN/passive.pcap"
+if have tcpdump; then
+  CREATE_SPINNER "LLDP/CDP/ARP"
+  timeout "${PASSIVE_LISTEN_SECS}s" tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null
+  tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+  tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+  tcpdump -nn -e -r "$PCAP" arp 2>/dev/null | awk '
+    {
+      mac=""
+      for (i=1;i<=NF;i++) if (mac=="" && $i ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) mac=$i
+      for (i=1;i<=NF;i++) {
+        if ($i=="tell")  { ip=$(i+1); gsub(/[,:]$/,"",ip); if (ip ~ /^[0-9]+\./ && mac!="") print ip"\t"mac }
+        if ($i=="is-at") { ip=$(i-1); gsub(/[,:]$/,"",ip); m=$(i+1); gsub(/[,:]$/,"",m); if (ip ~ /^[0-9]+\./ && m ~ /:/) print ip"\t"m }
+      }
+    }' | sort -u > "$RUN/passive_arp.tsv"
+  STOP_SPINNER
+else
+  : > "$RUN/lldp.txt"
+  : > "$RUN/cdp.txt"
+  : > "$RUN/passive_arp.tsv"
+  echo "tcpdump missing; passive capture skipped." > "$RUN/passive_skipped.txt"
+fi
+
+L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+L_DESC=$(lldp_field "$RUN/lldp.txt" 'System Description TLV')
+L_MGMT=$(grep -i 'Management Address' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+L_VLAN=$(grep -iE 'PVID|Port VLAN ID' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+
+C_DEV=$(grep -i 'Device-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_PLAT=$(grep -i 'Platform' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_PORT=$(grep -i 'Port-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+C_NVLAN=$(grep -i 'Native VLAN' "$RUN/cdp.txt" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1)
+C_ADDR=$(grep -iA2 'Address' "$RUN/cdp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+SWITCH="${L_NAME:-$C_DEV}"
+PORT="${L_PORT:-$C_PORT}"
+VLAN="${L_VLAN:-$C_NVLAN}"
+SW_MGMT="${L_MGMT:-$C_ADDR}"
+SW_DESC="${L_DESC:-$C_PLAT}"
+
+[ -z "$SWITCH" ] && SWITCH="Unknown switch"
+[ -z "$PORT" ] && PORT="Unknown port"
+[ -z "$VLAN" ] && VLAN="unknown"
+
+# ------------------------------ DHCP ----------------------------------------
+LED STAGE1
+SCREEN_WRITE "DHCP lease"
+NETMODE DHCP_CLIENT 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null
+
+IP=""; PREFIX=""
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | head -1)
+  if [ -n "$line" ]; then
+    IP=${line%/*}
+    PREFIX=${line#*/}
+    break
+  fi
+  sleep 1
+done
+
+# No lease is not fatal: the passive LLDP/CDP/ARP map is still worth exporting,
+# so note it and continue (active host discovery is simply skipped below).
+DHCP_OK=1
+if [ -z "$IP" ]; then
+  DHCP_OK=0
+  SCREEN_WRITE "No DHCP (passive only)"
+fi
+
+GATEWAY=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+CIDR=$(network_cidr "$IP" "$PREFIX")
+DNS=$(grep -h nameserver /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+DOMAIN=$(grep -hE '^(search|domain)' /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1)
+
+[ -z "$CIDR" ] && CIDR="unknown"
+[ -z "$GATEWAY" ] && GATEWAY="unknown"
+
+# -------------------------- DISCOVERY / SERVICES -----------------------------
+# hosts.tsv : ip \t host \t mac \t vendor \t ports \t segment_cidr  (accumulator)
+# segments.tsv : vlan_label \t cidr \t is_access \t gateway
+: > "$RUN/hosts.tsv"
+: > "$RUN/segments.tsv"
+
+# Always record the access/native segment so passive-only hosts have a home.
+printf '%s\t%s\t%s\t%s\n' "$VLAN" "$CIDR" "1" "$GATEWAY" >> "$RUN/segments.tsv"
+
+LED STAGE2
+SCREEN_WRITE "Host discovery"
+NATIVE_N=0
+if [ -n "$IP" ]; then
+  CREATE_SPINNER "Discover $CIDR"
+  NATIVE_N=$(scan_segment eth0 "$IP/$PREFIX" "$RUN/native" "$CIDR")
+  STOP_SPINNER
+fi
+
+# Add passive ARP-only hosts (access segment) not already discovered actively.
+awk -F'\t' '{print $1}' "$RUN/hosts.tsv" 2>/dev/null > "$RUN/known_ips.txt"
+while IFS=$'\t' read -r aip amac; do
+  [ -z "$aip" ] && continue
+  grep -qx "$aip" "$RUN/known_ips.txt" 2>/dev/null && continue
+  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$aip" "-" "$amac" "passive-observed" "-" "$CIDR" >> "$RUN/hosts.tsv"
+done < "$RUN/passive_arp.tsv"
+
+# ----------------------------- VLAN TRAVERSAL -------------------------------
+# Passively sniff 802.1Q tags (a trunk leaks them; an access port shows none),
+# then optionally scan each tagged VLAN and fold its hosts into the map.
+LED STAGE4
+SCREEN_WRITE "Mapping VLANs"
+PASSIVE_TAGS=""
+if have tcpdump; then
+  CREATE_SPINNER "802.1Q listen ${PASSIVE_VLAN_SECS}s"
+  timeout "${PASSIVE_VLAN_SECS}s" tcpdump -e -nn -i eth0 -c 300 vlan 2>/dev/null \
+    | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un > "$RUN/_tags.txt"
+  STOP_SPINNER
+  PASSIVE_TAGS=$(tr '\n' ' ' < "$RUN/_tags.txt" 2>/dev/null)
+fi
+TAGS_SEEN="$PASSIVE_TAGS"; [ -z "$TAGS_SEEN" ] && TAGS_SEEN="none (looks like an access port)"
+
+if [ "$SCAN_TAGGED_VLANS" = "1" ] && [ -n "$IP" ]; then
+  CANDIDATES="$PASSIVE_TAGS"
+  [ -z "$CANDIDATES" ] && CANDIDATES="$VLAN_PROBE_IDS"
+  if [ -n "$CANDIDATES" ] && have ip && have udhcpc; then
+    lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null
+    for vid in $CANDIDATES; do
+      LED STAGE5
+      SCREEN_WRITE "VLAN $vid"
+      CREATE_SPINNER "VLAN $vid: lease + scan"
+      ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
+      if ip link show "eth0.$vid" >/dev/null 2>&1; then
+        ip link set "eth0.$vid" up 2>/dev/null
+        udhcpc -i "eth0.$vid" -n -q -t 4 -T 3 >/dev/null 2>&1
+        vline=$(ip -o -4 addr show "eth0.$vid" 2>/dev/null | awk '{print $4}' | head -1)
+        if [ -n "$vline" ]; then
+          vcidr=$(network_cidr "${vline%/*}" "${vline#*/}")
+          vgw=$(ip route 2>/dev/null | awk -v d="eth0.$vid" '/default/ && $0 ~ ("dev "d){print $3; exit}')
+          [ -z "$vgw" ] && vgw="unknown"
+          if [ "$vcidr" != "$CIDR" ]; then
+            scan_segment "eth0.$vid" "$vcidr" "$RUN/vlan$vid" "$vcidr" >/dev/null
+            printf '%s\t%s\t%s\t%s\n' "vlan$vid" "$vcidr" "0" "$vgw" >> "$RUN/segments.tsv"
+          fi
+        fi
+        ip link set "eth0.$vid" down 2>/dev/null
+        ip link del "eth0.$vid" 2>/dev/null
+      fi
+      STOP_SPINNER
+    done
+  fi
+fi
+
+TOTAL_HOSTS=$(wc -l < "$RUN/hosts.tsv" 2>/dev/null | tr -d ' ')
+[ -z "$TOTAL_HOSTS" ] && TOTAL_HOSTS=0
+SEG_COUNT=$(wc -l < "$RUN/segments.tsv" 2>/dev/null | tr -d ' ')
+[ -z "$SEG_COUNT" ] && SEG_COUNT=0
+
+# ----------------------------- EMIT MERMAID ---------------------------------
+LED CLEANUP
+SCREEN_WRITE "Writing map"
+
+DROP_ID="drop"
+SWITCH_ID="switch_$(safe_id "$SWITCH")"
+PORT_ID="port_$(safe_id "$PORT")"
+ASID="subnet_$(safe_id "$CIDR")"          # access/native subnet node (DNS hangs here)
+
+# Pre-sanitize the fixed-node labels once per format.
+M_SWITCH=$(mmd_txt "$SWITCH"); M_DESC=$(mmd_txt "$SW_DESC"); M_PORT=$(mmd_txt "$PORT")
+D_SWITCH=$(dot_txt "$SWITCH"); D_DESC=$(dot_txt "$SW_DESC"); D_PORT=$(dot_txt "$PORT")
+
+{
+  echo "graph TD"
+  echo "  $DROP_ID[\"Shark Jack Drop<br/>$IP/$PREFIX\"]"
+  echo "  $SWITCH_ID[\"Switch<br/>$M_SWITCH<br/>$M_DESC\"]"
+  echo "  $PORT_ID[\"Port<br/>$M_PORT\"]"
+  echo "  $DROP_ID --> $PORT_ID"
+  echo "  $PORT_ID --> $SWITCH_ID"
+
+  # One subnet node per segment (access + each scanned VLAN), off the switch.
+  while IFS=$'\t' read -r seg_vlan seg_cidr seg_access seg_gw; do
+    [ -z "$seg_cidr" ] && continue
+    sid="subnet_$(safe_id "$seg_cidr")"
+    echo "  $sid[\"Subnet<br/>$(mmd_txt "$seg_cidr")<br/>VLAN $(mmd_txt "$seg_vlan")\"]"
+    echo "  $SWITCH_ID --> $sid"
+    if [ -n "$seg_gw" ] && [ "$seg_gw" != "unknown" ] && [ "$seg_gw" != "-" ]; then
+      gid="gateway_$(safe_id "$seg_gw")"
+      echo "  $gid[\"Gateway<br/>$(mmd_txt "$seg_gw")\"]"
+      echo "  $sid --> $gid"
+    fi
+  done < "$RUN/segments.tsv"
+
+  # Hosts hang off the subnet node of the segment they were found on.
+  while IFS=$'\t' read -r hip hhost hmac hvendor hports hseg; do
+    [ -z "$hip" ] && continue
+    hid="host_$(safe_id "$hip")"; sid="subnet_$(safe_id "$hseg")"
+    mh=$(mmd_txt "$hhost"); mp=$(mmd_txt "$hports")
+    label="$hip"
+    [ "$hhost" != "-" ] && label="$mh<br/>$hip"
+    [ "$hports" != "-" ] && [ -n "$hports" ] && label="$label<br/>$mp"
+    echo "  $hid[\"$label\"]"
+    echo "  $sid --> $hid"
+  done < "$RUN/hosts.tsv"
+
+  for d in $DNS; do
+    did="dns_$(safe_id "$d")"
+    echo "  $did[\"DNS<br/>$d\"]"
+    echo "  $ASID --> $did"
+  done
+} > "$MMD"
+
+# ------------------------------- EMIT DOT -----------------------------------
+{
+  echo "digraph topology {"
+  echo "  graph [rankdir=LR];"
+  echo "  node [shape=box];"
+  echo "  \"$DROP_ID\" [label=\"Shark Jack Drop\\n$IP/$PREFIX\"];"
+  echo "  \"$SWITCH_ID\" [label=\"Switch\\n$D_SWITCH\\n$D_DESC\"];"
+  echo "  \"$PORT_ID\" [label=\"Port\\n$D_PORT\"];"
+  echo "  \"$DROP_ID\" -> \"$PORT_ID\";"
+  echo "  \"$PORT_ID\" -> \"$SWITCH_ID\";"
+
+  while IFS=$'\t' read -r seg_vlan seg_cidr seg_access seg_gw; do
+    [ -z "$seg_cidr" ] && continue
+    sid="subnet_$(safe_id "$seg_cidr")"
+    echo "  \"$sid\" [label=\"Subnet\\n$(dot_txt "$seg_cidr")\\nVLAN $(dot_txt "$seg_vlan")\"];"
+    echo "  \"$SWITCH_ID\" -> \"$sid\";"
+    if [ -n "$seg_gw" ] && [ "$seg_gw" != "unknown" ] && [ "$seg_gw" != "-" ]; then
+      gid="gateway_$(safe_id "$seg_gw")"
+      echo "  \"$gid\" [label=\"Gateway\\n$(dot_txt "$seg_gw")\"];"
+      echo "  \"$sid\" -> \"$gid\";"
+    fi
+  done < "$RUN/segments.tsv"
+
+  while IFS=$'\t' read -r hip hhost hmac hvendor hports hseg; do
+    [ -z "$hip" ] && continue
+    hid="host_$(safe_id "$hip")"; sid="subnet_$(safe_id "$hseg")"
+    dh=$(dot_txt "$hhost"); dp=$(dot_txt "$hports")
+    label="$hip"
+    [ "$hhost" != "-" ] && label="$dh\\n$hip"
+    [ "$hports" != "-" ] && [ -n "$hports" ] && label="$label\\n$dp"
+    echo "  \"$hid\" [label=\"$label\"];"
+    echo "  \"$sid\" -> \"$hid\";"
+  done < "$RUN/hosts.tsv"
+
+  for d in $DNS; do
+    did="dns_$(safe_id "$d")"
+    echo "  \"$did\" [label=\"DNS\\n$d\"];"
+    echo "  \"$ASID\" -> \"$did\";"
+  done
+
+  echo "}"
+} > "$DOT"
+
+# ------------------------------ EMIT JSON -----------------------------------
+{
+  echo "{"
+  echo "  \"generated_at\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)\","
+  echo "  \"scope\": \"field_observed_single_vantage\","
+  echo "  \"nodes\": ["
+  echo "    {\"id\":\"$DROP_ID\",\"type\":\"drop\",\"label\":\"Shark Jack Drop\",\"ip\":\"$(json_escape "$IP")\",\"prefix\":\"$(json_escape "$PREFIX")\"},"
+  echo "    {\"id\":\"$SWITCH_ID\",\"type\":\"switch\",\"label\":\"$(json_escape "$SWITCH")\",\"management_ip\":\"$(json_escape "$SW_MGMT")\",\"description\":\"$(json_escape "$SW_DESC")\"},"
+  echo "    {\"id\":\"$PORT_ID\",\"type\":\"switch_port\",\"label\":\"$(json_escape "$PORT")\"}"
+
+  while IFS=$'\t' read -r seg_vlan seg_cidr seg_access seg_gw; do
+    [ -z "$seg_cidr" ] && continue
+    sid="subnet_$(safe_id "$seg_cidr")"
+    echo "    ,{\"id\":\"$sid\",\"type\":\"subnet\",\"label\":\"$(json_escape "$seg_cidr")\",\"vlan\":\"$(json_escape "$seg_vlan")\",\"access\":$([ "$seg_access" = "1" ] && echo true || echo false)}"
+    if [ -n "$seg_gw" ] && [ "$seg_gw" != "unknown" ] && [ "$seg_gw" != "-" ]; then
+      gid="gateway_$(safe_id "$seg_gw")"
+      echo "    ,{\"id\":\"$gid\",\"type\":\"gateway\",\"label\":\"$(json_escape "$seg_gw")\"}"
+    fi
+  done < "$RUN/segments.tsv"
+
+  while IFS=$'\t' read -r hip hhost hmac hvendor hports hseg; do
+    [ -z "$hip" ] && continue
+    hid="host_$(safe_id "$hip")"
+    echo "    ,{\"id\":\"$hid\",\"type\":\"host\",\"ip\":\"$(json_escape "$hip")\",\"hostname\":\"$(json_escape "$hhost")\",\"mac\":\"$(json_escape "$hmac")\",\"vendor\":\"$(json_escape "$hvendor")\",\"ports\":\"$(json_escape "$hports")\",\"subnet\":\"$(json_escape "$hseg")\"}"
+  done < "$RUN/hosts.tsv"
+
+  for d in $DNS; do
+    did="dns_$(safe_id "$d")"
+    echo "    ,{\"id\":\"$did\",\"type\":\"dns\",\"ip\":\"$(json_escape "$d")\"}"
+  done
+
+  echo "  ],"
+  echo "  \"edges\": ["
+  echo "    {\"from\":\"$DROP_ID\",\"to\":\"$PORT_ID\",\"relationship\":\"connected_to\"},"
+  echo "    {\"from\":\"$PORT_ID\",\"to\":\"$SWITCH_ID\",\"relationship\":\"belongs_to\"}"
+
+  while IFS=$'\t' read -r seg_vlan seg_cidr seg_access seg_gw; do
+    [ -z "$seg_cidr" ] && continue
+    sid="subnet_$(safe_id "$seg_cidr")"
+    echo "    ,{\"from\":\"$SWITCH_ID\",\"to\":\"$sid\",\"relationship\":\"carries_subnet\"}"
+    if [ -n "$seg_gw" ] && [ "$seg_gw" != "unknown" ] && [ "$seg_gw" != "-" ]; then
+      gid="gateway_$(safe_id "$seg_gw")"
+      echo "    ,{\"from\":\"$sid\",\"to\":\"$gid\",\"relationship\":\"default_gateway\"}"
+    fi
+  done < "$RUN/segments.tsv"
+
+  while IFS=$'\t' read -r hip hhost hmac hvendor hports hseg; do
+    [ -z "$hip" ] && continue
+    hid="host_$(safe_id "$hip")"; sid="subnet_$(safe_id "$hseg")"
+    echo "    ,{\"from\":\"$sid\",\"to\":\"$hid\",\"relationship\":\"observed_host\"}"
+  done < "$RUN/hosts.tsv"
+
+  for d in $DNS; do
+    did="dns_$(safe_id "$d")"
+    echo "    ,{\"from\":\"$ASID\",\"to\":\"$did\",\"relationship\":\"resolver\"}"
+  done
+
+  echo "  ]"
+  echo "}"
+} > "$JSON"
+
+# ------------------------------- SUMMARY ------------------------------------
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - NETWORK MAP EXPORTER"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Loot     : $RUN"
+  echo ""
+  echo "---- OBSERVED TOPOLOGY -----------------------------------"
+  echo " Drop     : Shark Jack on eth0"
+  echo " Network  : $([ "$DHCP_OK" -eq 1 ] && echo "DHCP lease OK" || echo "no DHCP - passive map only")"
+  echo " Switch   : $SWITCH"
+  echo " Port     : $PORT"
+  echo " Mgmt IP  : ${SW_MGMT:--}"
+  echo " Access VLAN: $VLAN"
+  echo " Gateway  : $GATEWAY"
+  echo " DNS      : ${DNS:--}"
+  echo " Hosts    : $TOTAL_HOSTS across $SEG_COUNT segment(s)"
+  echo ""
+  echo "---- SEGMENTS (subnets / VLANs mapped) -------------------"
+  echo " Tagged VLANs seen passively: $TAGS_SEEN"
+  if [ "$SCAN_TAGGED_VLANS" != "1" ]; then
+    echo " (VLAN traversal off: set SCAN_TAGGED_VLANS=1 to scan tagged VLANs)"
+  fi
+  while IFS=$'\t' read -r seg_vlan seg_cidr seg_access seg_gw; do
+    [ -z "$seg_cidr" ] && continue
+    sn=$(awk -F'\t' -v s="$seg_cidr" '$6==s' "$RUN/hosts.tsv" 2>/dev/null | wc -l | tr -d ' ')
+    lbl="VLAN $seg_vlan"; [ "$seg_access" = "1" ] && lbl="$lbl (access)"
+    printf " %-22s %-20s gw %-15s %s hosts\n" "$seg_cidr" "$lbl" "${seg_gw:--}" "$sn"
+  done < "$RUN/segments.tsv"
+  echo ""
+  echo "---- EXPORTS ---------------------------------------------"
+  echo " topology.json  - generic graph model (nodes carry vlan/subnet)"
+  echo " topology.mmd   - Mermaid diagram"
+  echo " topology.dot   - Graphviz DOT"
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " passive.pcap"
+  echo " lldp.txt / cdp.txt"
+  echo " passive_arp.tsv"
+  echo " native.discovery.gnmap / native.services.{nmap,xml}"
+  echo " vlan<id>.discovery.gnmap / vlan<id>.services.{nmap,xml}  (per scanned VLAN)"
+  echo ""
+  echo "---- LIMITATION ------------------------------------------"
+  echo " This is a field-observed map from one network drop. Tagged VLANs are"
+  echo " mapped only when SCAN_TAGGED_VLANS=1 and the port trunks them. It is"
+  echo " not an authoritative switch fabric map unless combined with additional"
+  echo " vantage points or switch management data."
+  echo "=========================================================="
+} > "$REPORT"
+
+[ "$DHCP_OK" -eq 1 ] && LED FINISH || LED SPECIAL
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Map export done"
+[ "$DHCP_OK" -eq 0 ] && SCREEN_WRITE "Passive only (no DHCP)"
+SCREEN_WRITE "Switch: $SWITCH"
+SCREEN_WRITE "Hosts: $TOTAL_HOSTS"
+SCREEN_WRITE "Segments: $SEG_COUNT"
+ALERT "Network map: $TOTAL_HOSTS hosts across $SEG_COUNT segment(s)$([ "$DHCP_OK" -eq 0 ] && echo ' (passive only)')" 12 2>/dev/null
+exit 0

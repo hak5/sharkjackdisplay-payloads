@@ -1,0 +1,40 @@
+# ============================================================================
+#  shark.conf - deploy configuration for deploy-shark.sh
+# ----------------------------------------------------------------------------
+#  Pick which payloads to load onto the Shark Jack Display, and optionally
+#  override config values inside each payload before it is pushed.
+#
+#  FORMAT
+#    [options]                         global settings (optional)
+#      shark_ip = 172.16.24.1          default device IP (password is prompted)
+#      install_oui_db = yes            install the nmap OUI database (yes/no)
+#
+#    [payload_name]                    one section per payload to load. The name
+#                                      is the payload's directory under
+#                                      payloads/library/<category>/.
+#      FIND --> REPLACE                optional. Literal find-and-replace applied
+#                                      to that payload's payload.txt before it is
+#                                      pushed. FIND must match the line EXACTLY
+#                                      (copy it from the payload's CONFIG block).
+#
+#  A payload section with no FIND --> REPLACE lines is loaded unchanged.
+#  Lines starting with # are comments. This file is gitignored: keep your real
+#  IPs / hostnames / secrets here.
+# ============================================================================
+
+[options]
+shark_ip = 172.16.24.1
+install_oui_db = yes
+
+# --- Load the port-ID beacon, unchanged ---
+[port_id_beacon]
+
+# --- Load jack_survey, pre-filled with the drop you expect ---
+[jack_survey]
+EXPECTED_SWITCH="" --> EXPECTED_SWITCH="MDF-SW-01"
+EXPECTED_VLAN="" --> EXPECTED_VLAN="20"
+
+# --- Load the remote debug bridge, pointed at your jump host ---
+[remote_debug_bridge]
+JUMP_HOST="X.X.X.X" --> JUMP_HOST="203.0.113.10"
+JUMP_USER="sharkdebug" --> JUMP_USER="bridge"

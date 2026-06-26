@@ -1,0 +1,301 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Voice & Camera Discovery (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop; ideally a phone/data port or a trunk.
+#  Category:    recon (passive)
+#  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Passively inventories the VoIP and physical-security estate on the segment
+#    it lands on, sending nothing. In one capture window it identifies:
+#      - IP phones ......... by MAC OUI, mDNS SIP, DHCP vendor class.
+#      - Cameras / NVRs .... by WS-Discovery (ONVIF), mDNS A/V services, OUI.
+#      - Voice VLAN ........ the VLAN the switch advertises to this port via
+#                            LLDP-MED Network Policy and/or CDP, corroborated by
+#                            802.1Q tags seen on the wire.
+#    Then it writes a leadership-ready inventory. Built for physical-security
+#    reviews, office moves, and M&A site surveys.
+#
+#  WHY PASSIVE
+#    It only listens: no DHCP request, no probes, no scans. That makes it safe
+#    to run on a live client network and quiet enough to leave running. It also
+#    means it inventories the BROADCAST DOMAIN it can see (see scope note in the
+#    README): to inventory a separate camera VLAN, land on that VLAN or a trunk.
+#
+#  AUTHORIZATION
+#    Passive capture only, on networks you own or are contracted to assess,
+#    within the agreed scope/time window. Do not retain third-party capture data
+#    beyond the engagement. All output stays on-device in /root/loot.
+#
+#  REQUIRES tcpdump:  opkg update && opkg install tcpdump
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+LISTEN_SECS=180                 # capture window. LLDP/CDP announce every 30-60s
+                                # and phones/cameras beacon periodically, so
+                                # >=120s is wise; longer catches more.
+LOOT_BASE="/root/loot/voice_camera"
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Lift an LLDP TLV value out of tcpdump -v output (value inline or next line).
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val); sub(/^Subtype[^:]*: /,"",val); print val; exit
+    }' "$1" 2>/dev/null
+}
+
+# Curated voice/video OUI table (first 3 octets). A convenience hint only: the
+# device's nmap-mac-prefixes table is authoritative for vendor strings, and
+# protocol evidence (ONVIF/mDNS/LLDP-MED) outranks OUI for classification.
+# Echoes "class|vendor"; class is phone, camera, or empty.
+oui_class() {
+  local p; p=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | cut -c1-8)
+  case "$p" in
+    00:04:f2|64:16:7f|48:25:67|00:e0:db)                         echo "phone|Polycom" ;;
+    80:5e:c0|00:15:65|24:9a:d8|80:5e:0c|70:46:34)                echo "phone|Yealink" ;;
+    00:0e:08)                                                    echo "phone|Cisco/Sipura" ;;
+    00:04:0d|3c:3a:73|b4:b0:17|00:1b:4f|00:09:6e|2c:f4:c5)       echo "phone|Avaya" ;;
+    08:00:0f|00:10:e0)                                           echo "phone|Mitel" ;;
+    00:0b:82|c0:74:ad)                                           echo "phone|Grandstream" ;;
+    00:04:13)                                                    echo "phone|Snom" ;;
+    00:08:5d)                                                    echo "phone|Aastra" ;;
+    44:19:b6|c0:56:e3|4c:bd:8f|bc:ad:28|28:57:be|a4:14:37|54:c4:15|e0:ca:3c) echo "camera|Hikvision" ;;
+    3c:ef:8c|90:02:a9|14:a7:8b|08:ed:ed|e0:50:8b|bc:32:5f|4c:11:bf|a0:bd:1d)  echo "camera|Dahua" ;;
+    00:40:8c|ac:cc:8e|b8:a4:4f|e8:27:25)                         echo "camera|Axis" ;;
+    00:09:18|e4:30:22)                                           echo "camera|Hanwha" ;;
+    00:07:5f|00:1c:44)                                           echo "camera|Bosch" ;;
+    00:02:d1)                                                    echo "camera|Vivotek" ;;
+    48:ea:63)                                                    echo "camera|Uniview" ;;
+    00:03:c5)                                                    echo "camera|Mobotix" ;;
+    *)                                                           echo "|" ;;
+  esac
+}
+# ============================================================================
+
+
+# ------------------------------ PHASE: SETUP --------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Voice & Camera Discovery"
+
+if ! have tcpdump; then
+  LED FAIL
+  SCREEN_WRITE "tcpdump missing"
+  ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
+  exit 1
+fi
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+PCAP="$RUN/capture.pcap"
+
+# Link up, no IP: frames flow without us announcing an address.
+ip link set eth0 up 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null            # don't start the capture before carrier is up
+
+
+# ---------------------------- PHASE: LISTEN ---------------------------------
+LED SPECIAL
+SCREEN_WRITE "Listening ${LISTEN_SECS}s"
+CREATE_PROGRESS_BAR "Capturing traffic" 2>/dev/null
+# Promisc left ON (no -p) so multicast control/discovery frames arrive.
+tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null &
+TPID=$!
+for i in $(seq 1 "$LISTEN_SECS"); do
+  SET_PROGRESS $(( i * 100 / LISTEN_SECS )) 2>/dev/null
+  sleep 1
+done
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+SET_PROGRESS 100 2>/dev/null
+
+
+# --------------------------- PHASE: DECODE ----------------------------------
+LED STAGE1
+SCREEN_WRITE "Decoding capture"
+
+# --- Switch neighbors: LLDP (0x88cc) + CDP (Cisco multicast) ---
+CREATE_SPINNER "LLDP / CDP"
+tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+C_DEV=$(grep -i 'Device-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+STOP_SPINNER
+
+# --- Voice VLAN: LLDP-MED Network Policy (Voice) and/or CDP, then 802.1Q tags ---
+# tcpdump's exact wording varies by version, so match "voice" lines and pull the
+# VLAN number near them; keep raw lldp.txt/cdp.txt for the authoritative read.
+VOICE_VLAN_LLDP=$(grep -iE 'voice' "$RUN/lldp.txt" 2>/dev/null | grep -oiE 'vlan[^0-9]{0,4}[0-9]+' | grep -oE '[0-9]+' | sort -un | tr '\n' ' ')
+VOICE_VLAN_CDP=$(grep -iE 'VoIP VLAN|Voice VLAN|Appliance VLAN' "$RUN/cdp.txt" 2>/dev/null | grep -oE '[0-9]+' | sort -un | tr '\n' ' ')
+TAGGED_VLANS=$(tcpdump -e -nn -r "$PCAP" vlan 2>/dev/null | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' ')
+[ -z "$VOICE_VLAN_LLDP" ] && VOICE_VLAN_LLDP="-"
+[ -z "$VOICE_VLAN_CDP" ]  && VOICE_VLAN_CDP="-"
+[ -z "$TAGGED_VLANS" ]    && TAGGED_VLANS="-"
+
+# --- ONVIF / WS-Discovery (UDP 3702): the strongest camera/NVR signal ---
+CREATE_SPINNER "ONVIF / mDNS"
+tcpdump -nn -A -r "$PCAP" 'udp port 3702' 2>/dev/null > "$RUN/wsdiscovery.txt"
+tcpdump -nn -r "$PCAP" 'udp port 3702' 2>/dev/null \
+  | sed -nE 's/^IP ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+ >.*/\1/p' \
+  | grep -vE '^(239|224)\.' | sort -u > "$RUN/wsd_ips.txt"
+
+# --- mDNS (UDP 5353): A/V service IPs (camera) and SIP service IPs (phone) ---
+tcpdump -nn -A -r "$PCAP" 'udp port 5353' 2>/dev/null > "$RUN/mdns.txt"
+grep -iE '_axis-video|_onvif|_rtsp|_dahua|_hikvision|_amcrest|_uniview|_csco-sb|_nvstream' "$RUN/mdns.txt" 2>/dev/null \
+  | sed -nE 's/^IP ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.5353 >.*/\1/p' | sort -u > "$RUN/mdns_cam_ips.txt"
+grep -iE '_sip\.|_sips|_h323|_ciscortp|_cisco' "$RUN/mdns.txt" 2>/dev/null \
+  | sed -nE 's/^IP ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\.5353 >.*/\1/p' | sort -u > "$RUN/mdns_sip_ips.txt"
+grep -oE '[A-Za-z0-9._-]+\.local' "$RUN/mdns.txt" 2>/dev/null | sort -u > "$RUN/mdns_names.txt"
+
+# --- SSDP / UPnP (UDP 1900): supplementary device hints ---
+tcpdump -nn -A -r "$PCAP" 'udp port 1900' 2>/dev/null | grep -iE '^(SERVER|LOCATION|ST|USN):' | sort -u > "$RUN/ssdp.txt"
+STOP_SPINNER
+
+# --- DHCP (67/68): vendor class (option 60) + hostnames as name enrichment ---
+CREATE_SPINNER "Passive ARP / DHCP"
+tcpdump -nn -e -vv -r "$PCAP" '(udp port 67 or udp port 68)' 2>/dev/null > "$RUN/dhcp.txt"
+{
+  grep -i 'Hostname Option' "$RUN/dhcp.txt" 2>/dev/null | sed 's/.*Hostname Option[^:]*: *//; s/^"//; s/".*$//'
+} | sort -u > "$RUN/dhcp_hostnames.txt"
+grep -i 'Option 60' "$RUN/dhcp.txt" 2>/dev/null | sed 's/.*Option 60[^:]*: *//; s/^"//; s/".*$//' | sort -u > "$RUN/dhcp_vendorclass.txt"
+
+# --- Passive ARP -> master host list (IP + MAC), no probes sent by us ---
+tcpdump -nn -e -r "$PCAP" arp 2>/dev/null | awk '
+  {
+    mac=""
+    for (i=1;i<=NF;i++) if (mac=="" && $i ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) mac=$i
+    for (i=1;i<=NF;i++) {
+      if ($i=="tell")  { ip=$(i+1);   gsub(/[,:]$/,"",ip);   if (ip ~ /^[0-9]+\./ && mac!="") print ip"\t"mac }
+      if ($i=="is-at") { ip=$(i-1); gsub(/[,:]$/,"",ip); m=$(i+1); gsub(/[,:]$/,"",m); if (ip ~ /^[0-9]+\./ && m ~ /:/) print ip"\t"m }
+    }
+  }' | sort -u > "$RUN/arp_hosts.tsv"
+STOP_SPINNER
+
+
+# --------------------------- PHASE: CLASSIFY --------------------------------
+LED STAGE2
+SCREEN_WRITE "Classifying devices"
+
+mac_for() { awk -F'\t' -v ip="$1" '$1==ip{print $2; exit}' "$RUN/arp_hosts.tsv" 2>/dev/null; }
+
+# Candidate IPs = everything we have any handle on (ARP + ONVIF + mDNS).
+{ cut -f1 "$RUN/arp_hosts.tsv" 2>/dev/null
+  cat "$RUN/wsd_ips.txt" "$RUN/mdns_cam_ips.txt" "$RUN/mdns_sip_ips.txt" 2>/dev/null
+} | grep -E '^[0-9]+\.' | sort -u > "$RUN/candidates.txt"
+
+: > "$RUN/phones.tsv"
+: > "$RUN/cameras.tsv"
+OTHER=0
+
+while read -r ip; do
+  [ -z "$ip" ] && continue
+  mac=$(mac_for "$ip"); [ -z "$mac" ] && mac="-"
+  oc=$(oui_class "$mac"); ocls=${oc%%|*}; oven=${oc#*|}; [ -z "$oven" ] && oven="-"
+
+  cam_ev=""
+  grep -qxF "$ip" "$RUN/wsd_ips.txt"      2>/dev/null && cam_ev="ONVIF/WS-Discovery"
+  grep -qxF "$ip" "$RUN/mdns_cam_ips.txt" 2>/dev/null && cam_ev="${cam_ev:+$cam_ev, }mDNS A/V"
+  [ "$ocls" = "camera" ] && cam_ev="${cam_ev:+$cam_ev, }OUI:$oven"
+
+  phone_ev=""
+  grep -qxF "$ip" "$RUN/mdns_sip_ips.txt" 2>/dev/null && phone_ev="mDNS SIP"
+  [ "$ocls" = "phone" ] && phone_ev="${phone_ev:+$phone_ev, }OUI:$oven"
+
+  if [ -n "$cam_ev" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$ip" "$mac" "$oven" "$cam_ev" >> "$RUN/cameras.tsv"
+  elif [ -n "$phone_ev" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$ip" "$mac" "$oven" "$phone_ev" >> "$RUN/phones.tsv"
+  else
+    OTHER=$((OTHER + 1))
+  fi
+done < "$RUN/candidates.txt"
+
+NPHONE=$(wc -l < "$RUN/phones.tsv" 2>/dev/null | tr -d ' '); [ -z "$NPHONE" ] && NPHONE=0
+NCAM=$(wc -l < "$RUN/cameras.tsv" 2>/dev/null | tr -d ' '); [ -z "$NCAM" ] && NCAM=0
+
+VOICE_SUMMARY="$VOICE_VLAN_LLDP"
+[ "$VOICE_SUMMARY" = "-" ] && VOICE_SUMMARY="$VOICE_VLAN_CDP"
+[ "$VOICE_SUMMARY" = "-" ] && VOICE_SUMMARY="none advertised"
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+LED CLEANUP
+SCREEN_WRITE "Writing loot"
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - VOICE & CAMERA DISCOVERY"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Window   : ${LISTEN_SECS}s passive capture on eth0"
+  echo " Scope    : the broadcast domain(s) visible from this port"
+  echo ""
+  echo "---- VOICE VLAN ------------------------------------------"
+  echo " LLDP-MED voice VLAN : $VOICE_VLAN_LLDP"
+  echo " CDP voice VLAN      : $VOICE_VLAN_CDP"
+  echo " 802.1Q tags seen    : $TAGGED_VLANS"
+  echo " Note: the voice VLAN is what the switch advertises to THIS port."
+  echo "       Tagged VLANs corroborate it (voice frames are tagged)."
+  echo ""
+  echo "---- SWITCH / PORT (for locating the drop) ---------------"
+  echo " LLDP system name : ${L_NAME:--}"
+  echo " LLDP our port    : ${L_PORT:--}"
+  echo " CDP device       : ${C_DEV:--}"
+  echo ""
+  echo "---- IP PHONES ($NPHONE) ---------------------------------"
+  if [ "$NPHONE" -gt 0 ]; then
+    printf " %-15s %-17s %-12s %s\n" "IP" "MAC" "Vendor" "Evidence"
+    awk -F'\t' '{printf " %-15s %-17s %-12s %s\n",$1,$2,$3,$4}' "$RUN/phones.tsv"
+  else
+    echo " (none identified in the visible broadcast domain)"
+  fi
+  echo ""
+  echo "---- CAMERAS / NVRs ($NCAM) ------------------------------"
+  if [ "$NCAM" -gt 0 ]; then
+    printf " %-15s %-17s %-12s %s\n" "IP" "MAC" "Vendor" "Evidence"
+    awk -F'\t' '{printf " %-15s %-17s %-12s %s\n",$1,$2,$3,$4}' "$RUN/cameras.tsv"
+  else
+    echo " (none identified in the visible broadcast domain)"
+  fi
+  echo ""
+  echo "---- OTHER HOSTS SEEN ------------------------------------"
+  echo " $OTHER non-voice/video host(s) observed (not detailed here)."
+  echo ""
+  echo "---- DHCP-OBSERVED NAMES / VENDOR CLASSES ----------------"
+  if [ -s "$RUN/dhcp_hostnames.txt" ] || [ -s "$RUN/dhcp_vendorclass.txt" ]; then
+    [ -s "$RUN/dhcp_hostnames.txt" ]   && { echo " Hostnames:";      sed 's/^/   /' "$RUN/dhcp_hostnames.txt"; }
+    [ -s "$RUN/dhcp_vendorclass.txt" ] && { echo " Vendor classes:"; sed 's/^/   /' "$RUN/dhcp_vendorclass.txt"; }
+  else
+    echo " (no DHCP broadcasts captured in window)"
+  fi
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " capture.pcap          - full passive capture (open in Wireshark)"
+  echo " lldp.txt / cdp.txt    - neighbor + voice VLAN decode"
+  echo " wsdiscovery.txt       - ONVIF WS-Discovery (camera/NVR)"
+  echo " mdns.txt / ssdp.txt   - service discovery"
+  echo " dhcp.txt              - DHCP option decode"
+  echo " arp_hosts.tsv         - passive host list (IP + MAC)"
+  echo " phones.tsv / cameras.tsv - the inventory tables"
+  echo "=========================================================="
+} > "$REPORT"
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+LED FINISH
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Voice/Camera done"
+SCREEN_WRITE "Phones: $NPHONE"
+SCREEN_WRITE "Cameras: $NCAM"
+SCREEN_WRITE "Voice VLAN: $VOICE_SUMMARY"
+ALERT "Voice/Camera: $NPHONE phones, $NCAM cameras, voice VLAN $VOICE_SUMMARY" 12 2>/dev/null
+exit 0

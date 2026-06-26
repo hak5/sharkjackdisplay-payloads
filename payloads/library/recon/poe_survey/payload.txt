@@ -1,0 +1,234 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       PoE Survey (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop you are evaluating for PoE.
+#  Category:    recon (passive)
+#  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Reports the Power-over-Ethernet posture of a drop by passively reading what
+#    the switch advertises, the same negotiation APs and cameras use:
+#      - PoE present?  .... is the port PSE-capable, and is power enabled?
+#      - PoE class?    .... advertised class (0-4) and type (802.3af/at/bt).
+#      - Power budget? .... PSE allocated / available watts (LLDP and CDP).
+#    Useful when planning AP or IP-camera deployments, or any time a drop has to
+#    deliver PoE before you commit hardware to it.
+#
+#  HARDWARE NOTE (read this)
+#    The Shark Jack is NOT a PoE powered device and has no way to electrically
+#    measure line voltage (its NIC magnetics block DC, and it presents no PD
+#    signature so a compliant switch never energizes it). This payload therefore
+#    does NOT measure power. It reports what the switch ADVERTISES over LLDP /
+#    CDP, which is authoritative for what the port will negotiate, but only
+#    exists if the switch runs LLDP/CDP and advertises power. If nothing is
+#    advertised the result is INCONCLUSIVE: confirm with a hardware PoE tester.
+#
+#  AUTHORIZATION
+#    Passive capture only (no probes, no scans, no DHCP). Run on networks you own
+#    or are contracted to assess, within scope. Output stays on-device in
+#    /root/loot until you pull it.
+#
+#  REQUIRES tcpdump:  opkg update && opkg install tcpdump
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+LISTEN_SECS=120                 # LLDP carries the power TLV every ~30s and CDP
+                                # every ~60s, so >=90s catches a couple cycles.
+LOOT_BASE="/root/loot/poe_survey"
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+have() { command -v "$1" >/dev/null 2>&1; }
+
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val); sub(/^Subtype[^:]*: /,"",val); print val; exit
+    }' "$1" 2>/dev/null
+}
+
+# Translate an 802.3 PoE class digit to its PD power envelope (handy when only a
+# class is advertised, with no explicit allocated-watts value).
+class_power() {
+  case "$1" in
+    0) echo "<= 12.95 W (Class 0, Type 1)" ;;
+    1) echo "<= 3.84 W (Class 1, Type 1)" ;;
+    2) echo "<= 6.49 W (Class 2, Type 1)" ;;
+    3) echo "<= 12.95 W (Class 3, Type 1)" ;;
+    4) echo "<= 25.5 W (Class 4, Type 2 / 802.3at)" ;;
+    *) echo "-" ;;
+  esac
+}
+# ============================================================================
+
+
+# ------------------------------ PHASE: SETUP --------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "PoE Survey"
+
+if ! have tcpdump; then
+  LED FAIL
+  SCREEN_WRITE "tcpdump missing"
+  ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
+  exit 1
+fi
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+PCAP="$RUN/capture.pcap"
+
+# Link up, no IP: passive only.
+ip link set eth0 up 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null
+
+
+# ---------------------------- PHASE: LISTEN ---------------------------------
+LED SPECIAL
+SCREEN_WRITE "Listening ${LISTEN_SECS}s"
+CREATE_PROGRESS_BAR "Capturing LLDP/CDP" 2>/dev/null
+tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null &
+TPID=$!
+for i in $(seq 1 "$LISTEN_SECS"); do
+  SET_PROGRESS $(( i * 100 / LISTEN_SECS )) 2>/dev/null
+  sleep 1
+done
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+SET_PROGRESS 100 2>/dev/null
+
+
+# --------------------------- PHASE: DECODE ----------------------------------
+LED STAGE1
+SCREEN_WRITE "Reading power TLVs"
+CREATE_SPINNER "LLDP / CDP power"
+
+tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+
+L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+C_DEV=$(grep -i 'Device-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+
+LLDP_SEEN=no; [ -s "$RUN/lldp.txt" ] && LLDP_SEEN=yes
+CDP_SEEN=no;  [ -s "$RUN/cdp.txt" ]  && CDP_SEEN=yes
+
+# Pull just the power-relevant lines so the report can show ground truth, and so
+# parsing is tolerant of tcpdump wording differences across versions.
+grep -iE 'power|MDI' "$RUN/lldp.txt" 2>/dev/null > "$RUN/poe_lldp.txt"
+grep -iE 'power'      "$RUN/cdp.txt"  2>/dev/null > "$RUN/poe_cdp.txt"
+
+# --- LLDP 802.3 Power-via-MDI / Extended Power-via-MDI ---
+POWER_TLV=no
+grep -iqE 'power via mdi|power pair|MDI power|allocated power|requested power|power class|power type' \
+  "$RUN/poe_lldp.txt" && POWER_TLV=yes
+
+PSE_CAP="-"
+grep -iqE '\bPSE\b' "$RUN/poe_lldp.txt" && PSE_CAP="yes (PSE advertised)"
+POE_STATE="-"
+grep -iqE 'enabled'  "$RUN/poe_lldp.txt" && POE_STATE="enabled"
+grep -iqE 'disabled' "$RUN/poe_lldp.txt" && POE_STATE="disabled"
+
+POE_CLASS=$(grep -ioE 'class[ ]?[0-9]' "$RUN/poe_lldp.txt" | head -1)
+CLASS_NUM=$(printf '%s' "$POE_CLASS" | grep -oE '[0-9]' | head -1)
+CLASS_ENVELOPE=$(class_power "${CLASS_NUM:-x}")
+
+POE_TYPE=$(grep -ioE 'power type[^,]*' "$RUN/poe_lldp.txt" | head -1)
+POE_PAIR=$(grep -ioE 'power pair[^,]*' "$RUN/poe_lldp.txt" | head -1)
+
+# 802.3at power values are in 0.1 W units. Require the number to follow the
+# label directly (a colon or spaces) so we read the value, not a TLV header.
+ALLOC=$(grep -ioE 'allocated power value[: ]+[0-9]+' "$RUN/poe_lldp.txt" | grep -oE '[0-9]+$' | head -1)
+REQ=$(grep -ioE 'requested power value[: ]+[0-9]+'   "$RUN/poe_lldp.txt" | grep -oE '[0-9]+$' | head -1)
+ALLOC_W="-"; [ -n "$ALLOC" ] && ALLOC_W=$(awk -v a="$ALLOC" 'BEGIN{printf "%.1f W", a/10}')
+REQ_W="-";   [ -n "$REQ" ]   && REQ_W=$(awk -v a="$REQ" 'BEGIN{printf "%.1f W", a/10}')
+
+# --- CDP power (Cisco): values are in milliwatts. "Power Available" appears both
+# as the TLV name and before the value, so anchor on the number that follows. ---
+CDP_AVAIL=$(grep -ioE 'power available[: ]+[0-9]+' "$RUN/poe_cdp.txt" | grep -oE '[0-9]+$' | head -1)
+CDP_AVAIL_W="-"; [ -n "$CDP_AVAIL" ] && CDP_AVAIL_W=$(awk -v a="$CDP_AVAIL" 'BEGIN{printf "%.1f W", a/1000}')
+
+
+# --------------------------- PHASE: VERDICT ---------------------------------
+if [ "$POWER_TLV" = "yes" ] || [ -n "$CDP_AVAIL" ]; then
+  VERDICT="PoE AVAILABLE"
+  REASON="switch advertises PoE power on this port (LLDP/CDP)"
+  VLED="FINISH"
+elif [ "$LLDP_SEEN" = "yes" ] || [ "$CDP_SEEN" = "yes" ]; then
+  VERDICT="INCONCLUSIVE"
+  REASON="LLDP/CDP heard but no power TLV; port may be non-PoE, or PoE simply not advertised. Confirm with a hardware PoE tester."
+  VLED="SPECIAL"
+else
+  VERDICT="UNKNOWN"
+  REASON="no LLDP/CDP heard; unmanaged switch, a dumb injector, or LLDP/CDP disabled. Use a hardware PoE tester."
+  VLED="SPECIAL"
+fi
+
+
+# --------------------------- PHASE: WRITE LOOT ------------------------------
+LED CLEANUP
+SCREEN_WRITE "Writing loot"
+STOP_SPINNER
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - PoE SURVEY"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Window   : ${LISTEN_SECS}s passive capture on eth0"
+  echo ""
+  echo "---- VERDICT ---------------------------------------------"
+  echo " PoE      : $VERDICT"
+  echo " Reason   : $REASON"
+  echo ""
+  echo "---- LLDP POWER-VIA-MDI ----------------------------------"
+  echo " LLDP heard      : $LLDP_SEEN"
+  echo " Power TLV        : $POWER_TLV"
+  echo " PSE capable      : $PSE_CAP"
+  echo " Power state      : $POE_STATE"
+  echo " Class            : ${POE_CLASS:--}  ($CLASS_ENVELOPE)"
+  echo " ${POE_TYPE:-Power type -}"
+  echo " ${POE_PAIR:-Power pair -}"
+  echo " PD requested     : ${REQ_W} (raw ${REQ:--}, 0.1W units)"
+  echo " PSE allocated    : ${ALLOC_W} (raw ${ALLOC:--}, 0.1W units)"
+  echo ""
+  echo "---- CDP POWER (Cisco) -----------------------------------"
+  echo " CDP heard       : $CDP_SEEN"
+  echo " Power available  : ${CDP_AVAIL_W} (raw ${CDP_AVAIL:--} mW)"
+  echo ""
+  echo "---- SWITCH / PORT (for locating the drop) ---------------"
+  echo " LLDP system name : ${L_NAME:--}"
+  echo " LLDP our port    : ${L_PORT:--}"
+  echo " CDP device       : ${C_DEV:--}"
+  echo ""
+  echo "---- RAW POWER TLV LINES (ground truth) ------------------"
+  if [ -s "$RUN/poe_lldp.txt" ]; then sed 's/^/ /' "$RUN/poe_lldp.txt"; else echo " (no LLDP power lines)"; fi
+  if [ -s "$RUN/poe_cdp.txt" ];  then sed 's/^/ /' "$RUN/poe_cdp.txt";  fi
+  echo ""
+  echo "---- HARDWARE NOTE ---------------------------------------"
+  echo " The Shark Jack cannot electrically measure PoE; these values are READ"
+  echo " from the switch's LLDP/CDP advertisements, not metered. For ground"
+  echo " truth on an unmanaged port, use a hardware PoE tester."
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " capture.pcap         - full passive capture (open in Wireshark)"
+  echo " lldp.txt / cdp.txt   - full neighbor decode"
+  echo " poe_lldp.txt / poe_cdp.txt - extracted power lines"
+  echo "=========================================================="
+} > "$REPORT"
+
+
+# ------------------------------ PHASE: DONE ---------------------------------
+LED "$VLED"
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "PoE: $VERDICT"
+[ "$VERDICT" = "PoE AVAILABLE" ] && SCREEN_WRITE "Class: ${POE_CLASS:--}"
+[ "$ALLOC_W" != "-" ] && SCREEN_WRITE "Alloc: $ALLOC_W"
+[ "$ALLOC_W" = "-" ] && [ "$CDP_AVAIL_W" != "-" ] && SCREEN_WRITE "Avail: $CDP_AVAIL_W"
+SCREEN_WRITE "Sw: ${L_NAME:-${C_DEV:-unknown}}"
+ALERT "PoE Survey: $VERDICT (class ${POE_CLASS:--}, alloc ${ALLOC_W})" 12 2>/dev/null
+exit 0

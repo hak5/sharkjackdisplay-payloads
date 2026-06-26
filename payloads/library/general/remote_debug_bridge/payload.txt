@@ -1,0 +1,217 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Remote Debug Bridge (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An authorized wired drop you need to reach back into remotely.
+#  Category:    general / remote-access / troubleshooting
+#  Version:     1.1
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Turns the Shark Jack into a temporary remote-troubleshooting appliance, so
+#    you can debug stranded gear from a desk instead of from a cold aisle. It:
+#      - Brings up eth0 (DHCP, or a static datacenter mgmt drop).
+#      - Opens a reverse SSH tunnel to a jump host you control, exposing the
+#        Shark Jack's own sshd back through it.
+#      - Auto-reconnects: a tunnel that was healthy re-dials on a drop; only
+#        repeated fast failures count toward giving up.
+#      - Shows live status on the OLED and logs every attempt on-device.
+#    From the jump host you then:  ssh -p <REMOTE_PORT> root@127.0.0.1
+#    which lands you on the Shark Jack. It is L2-present on the stranded
+#    segment, so you reach the switches/fabric from there.
+#
+#  AUTHORIZATION
+#    This opens a remote-access path INTO a network. Deploy ONLY on networks you
+#    own or are contracted to support, with written authorization, and tear it
+#    down when the work is finished. Auth is key-only to a jump host you control,
+#    with strict host-key checking. Local logs stay on-device under /root/loot.
+#
+#  PREREQUISITES (one-time; see README)
+#    - A keypair at SSH_KEY, its public key in the jump user's authorized_keys.
+#    - The jump host's key pinned in KNOWN_HOSTS (ssh-keyscan), because this
+#      enforces StrictHostKeyChecking=yes.
+#    - openssh-client on the Shark Jack (the options below are OpenSSH syntax).
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+# Jump host: a small always-on VM you control. The reverse tunnel lands here.
+JUMP_USER="sharkdebug"
+JUMP_HOST="X.X.X.X"             # cloud VM public IP or DNS. MUST be set.
+JUMP_PORT="22"
+
+# Reverse forward: on the jump host this port maps back to the Shark Jack sshd.
+REMOTE_BIND="127.0.0.1"         # keep the listener local to the jump host
+REMOTE_PORT="2222"              # then, on the jump host: ssh -p 2222 root@127.0.0.1
+
+# Key-only auth and a pinned host key (no passwords, no blind TOFU).
+SSH_KEY="/root/.ssh/sharkjack_debug"
+KNOWN_HOSTS="/root/.ssh/known_hosts"
+
+# Network bring-up. DHCP_CLIENT suits a normal drop; a stranded datacenter mgmt
+# port is often static, so fill STATIC_* and set NET_MODE="STATIC".
+NET_MODE="DHCP_CLIENT"          # DHCP_CLIENT | AUTO | STATIC
+STATIC_IP="192.168.1.250"       # used only when NET_MODE=STATIC
+STATIC_SUBNET="255.255.255.0"   # used only when NET_MODE=STATIC
+STATIC_GATEWAY="192.168.1.1"    # used only when NET_MODE=STATIC
+DHCP_WAIT_SECS=30
+
+# Tunnel behavior.
+CONNECT_TIMEOUT=10              # per-dial TCP/auth timeout
+MAX_RETRIES=15                  # give up after this many CONSECUTIVE fast fails
+RETRY_SLEEP=10                  # base wait between dials (grows on repeat fails)
+STABLE_SECS=60                  # a tunnel up at least this long counts as healthy
+                                # and resets the consecutive-failure counter
+
+LOOT_BASE="/root/loot/debug_bridge"
+# ----------------------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Shared SSH options: key-only, pinned host key, dead-peer detection.
+SSH_OPTS="-i $SSH_KEY -p $JUMP_PORT \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o PasswordAuthentication=no \
+  -o ConnectTimeout=$CONNECT_TIMEOUT \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=2 \
+  -o ExitOnForwardFailure=yes \
+  -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=$KNOWN_HOSTS"
+
+# ------------------------------ SETUP ---------------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Remote Debug Bridge"
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+LOG="$RUN/bridge.log"
+
+fail() {  # fail <screen msg> <report reason>
+  LED FAIL
+  SCREEN_WRITE "$1"
+  echo "FAILED: $2" > "$REPORT"
+  ALERT "$2" 8 2>/dev/null
+  exit 1
+}
+
+have ssh || fail "ssh missing" "ssh client missing (opkg install openssh-client)"
+[ -f "$SSH_KEY" ] || fail "missing SSH key" "missing SSH key at $SSH_KEY"
+[ "$JUMP_HOST" = "X.X.X.X" ] || [ -z "$JUMP_HOST" ] && fail "set JUMP_HOST" "JUMP_HOST is not configured (still the placeholder)"
+[ -s "$KNOWN_HOSTS" ] || fail "pin host key" "KNOWN_HOSTS empty; pin the jump host: ssh-keyscan -p $JUMP_PORT $JUMP_HOST >> $KNOWN_HOSTS"
+
+chmod 600 "$SSH_KEY" 2>/dev/null
+
+# --------------------------- PHASE: NETWORK UP ------------------------------
+LED SPECIAL
+SCREEN_WRITE "Bringing up eth0 ($NET_MODE)"
+case "$NET_MODE" in
+  STATIC) NETMODE STATIC IP_${STATIC_IP} SUBNET_${STATIC_SUBNET} GATEWAY_${STATIC_GATEWAY} 2>/dev/null ;;
+  AUTO)   NETMODE AUTO 2>/dev/null ;;
+  *)      NETMODE DHCP_CLIENT 2>/dev/null ;;
+esac
+WAIT_FOR_LINK 2>/dev/null            # block until carrier is up (the race fix)
+
+IP=""; PREFIX=""
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | head -1)
+  if [ -n "$line" ]; then IP=${line%/*}; PREFIX=${line#*/}; break; fi
+  sleep 1
+done
+[ -z "$IP" ] && fail "no network" "no IPv4 on eth0 after ${DHCP_WAIT_SECS}s (NET_MODE=$NET_MODE; NAC/802.1X, no DHCP, or dead drop)"
+
+GW=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+ENABLE_NTP 2>/dev/null               # best-effort clock sync for honest timestamps
+SCREEN_WRITE "IP $IP/$PREFIX"
+
+# --------------------------- PHASE: REACHABILITY ----------------------------
+LED STAGE1
+SCREEN_WRITE "Testing jump reachability"
+if ! ping -c 1 -W 3 "$JUMP_HOST" >/dev/null 2>&1; then
+  echo "$(date -u 2>/dev/null) ping to $JUMP_HOST failed (ICMP may be filtered); trying SSH anyway" >> "$LOG"
+fi
+
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - REMOTE DEBUG BRIDGE"
+  echo "=========================================================="
+  echo " Run time     : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Local IP     : $IP/$PREFIX   (NET_MODE=$NET_MODE)"
+  echo " Gateway      : ${GW:-unknown}"
+  echo " Jump host    : $JUMP_USER@$JUMP_HOST:$JUMP_PORT"
+  echo " Reverse fwd  : $REMOTE_BIND:$REMOTE_PORT -> Shark Jack 127.0.0.1:22"
+  echo ""
+  echo " From the jump host, connect to the Shark Jack with:"
+  echo "   ssh -p $REMOTE_PORT root@127.0.0.1"
+  echo ""
+  echo " Live attempt timeline is in bridge.log."
+  echo "=========================================================="
+} > "$REPORT"
+
+# --------------------------- PHASE: BRIDGE LOOP -----------------------------
+# Reverse tunnel with resilient reconnect. A tunnel that stays up past
+# STABLE_SECS is "healthy", so a later drop resets the failure counter; only
+# repeated FAST failures (bad key, port in use, jump host down) count toward
+# MAX_RETRIES, with a growing backoff between them.
+attempt=0
+fails=0
+while [ "$fails" -lt "$MAX_RETRIES" ]; do
+  attempt=$((attempt + 1))
+  LED STAGE2
+  SCREEN_WRITE "Dial $((fails + 1))/$MAX_RETRIES"
+
+  STAMP=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+  echo "$STAMP attempt $attempt (consecutive fails $fails)" >> "$LOG"
+
+  # Pre-check + breadcrumb: a quick auth'd command proves egress and key auth
+  # before we commit to the blocking tunnel, and leaves an "I'm alive" marker.
+  if ! ssh $SSH_OPTS "$JUMP_USER@$JUMP_HOST" \
+        "printf '%s\n' \"shark bridge up from $IP/$PREFIX at $STAMP\" >> ~/sharkjack-bridge.log" \
+        >> "$LOG" 2>&1; then
+    fails=$((fails + 1))
+    SCREEN_WRITE "Jump unreachable"
+    echo "$STAMP jump host unreachable or auth failed" >> "$LOG"
+    back=$((RETRY_SLEEP * fails)); [ "$back" -gt 60 ] && back=60
+    sleep "$back"
+    continue
+  fi
+
+  LED ATTACK
+  SCREEN_WRITE "Tunnel up"
+  SCREEN_WRITE "$REMOTE_BIND:$REMOTE_PORT"
+
+  start=$(date +%s 2>/dev/null)
+  ssh -N $SSH_OPTS -R "$REMOTE_BIND:$REMOTE_PORT:127.0.0.1:22" "$JUMP_USER@$JUMP_HOST" >> "$LOG" 2>&1
+  rc=$?
+  end=$(date +%s 2>/dev/null)
+  up=$((end - start))
+  echo "$(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null) tunnel exited rc=$rc after ${up}s" >> "$LOG"
+
+  if [ "$up" -ge "$STABLE_SECS" ]; then
+    fails=0                                   # healthy session; a drop is transient
+    SCREEN_WRITE "Reconnecting"
+    sleep "$RETRY_SLEEP"
+  else
+    fails=$((fails + 1))                      # fast failure; count it, back off
+    SCREEN_WRITE "Drop, retrying"
+    back=$((RETRY_SLEEP * fails)); [ "$back" -gt 60 ] && back=60
+    sleep "$back"
+  fi
+done
+
+# ------------------------------ PHASE: ENDED --------------------------------
+LED FAIL
+SCREEN_WRITE "Bridge ended"
+SCREEN_WRITE "$MAX_RETRIES fails"
+{
+  echo ""
+  echo "---- FINAL STATUS ----------------------------------------"
+  echo " Ended at     : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Dials made   : $attempt"
+  echo " Reason       : $MAX_RETRIES consecutive fast failures (see bridge.log)"
+  echo "=========================================================="
+} >> "$REPORT"
+ALERT "Debug bridge ended after $MAX_RETRIES consecutive failures" 10 2>/dev/null
+exit 0

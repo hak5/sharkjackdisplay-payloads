@@ -1,0 +1,356 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Direct Host Profiler (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      One unknown device, cabled directly to the Shark Jack.
+#  Category:    recon / admin / device-identification / troubleshooting
+#  Version:     1.2
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Answers "which physical device is HostXYZ?" when something on the network
+#    is noisy or eating bandwidth but not bad enough to blanket-block its MAC.
+#    Unplug the suspect, plug it straight into the Shark Jack, and:
+#      - Become a DHCP server (the device's built-in NETMODE DHCP_SERVER). The
+#        Shark Jack has no uplink, so the client gets an address but no route
+#        off the device: it is isolated by construction.
+#      - Capture the lease, the DHCP hostname, and the vendor class.
+#      - Harvest mDNS / NetBIOS / LLMNR names the device announces.
+#      - Scan ONLY that one leased client IP for ports / service / OS.
+#      - Fuse it all into a device-identification report.
+#
+#  AUTHORIZATION
+#    Active against the single directly-attached device only: it never touches
+#    the production network (it is its own isolated DHCP island). Run on devices
+#    you own or are contracted to assess. Nothing is exfiltrated: all output
+#    stays on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+# DHCP is served by the device's built-in NETMODE DHCP_SERVER (it uses the IP /
+# subnet from the unit's config.txt). There is no separate udhcpd to configure.
+LINK_WAIT_SECS=20               # wait for carrier after the device is cabled
+CLIENT_WAIT_SECS=60             # wait for the device to take a DHCP lease
+PASSIVE_LISTEN_SECS=45          # name-capture window held open after the lease
+
+PORTSET="21,22,23,25,53,80,110,139,143,443,445,515,554,631,3389,5000,5357,5900,8000,8080,8443,9100"
+NMAP_TIMING="-T4"
+HOST_TIMEOUT="60s"
+
+LOOT_BASE="/root/loot/direct_host"
+# ----------------------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+get_link_state() {
+  cat /sys/class/net/eth0/carrier 2>/dev/null | grep -q 1 && echo "UP" || echo "DOWN"
+}
+
+get_speed() { cat /sys/class/net/eth0/speed 2>/dev/null; }
+get_duplex() { cat /sys/class/net/eth0/duplex 2>/dev/null | tr 'A-Z' 'a-z'; }
+
+guess_type() {
+  local hay ports
+  hay=$(printf '%s %s %s %s' "$1" "$2" "$3" "$4" | tr 'A-Z' 'a-z')
+  ports=",$5,"
+
+  case "$hay" in
+    *raspberr*|*raspbian*) echo "Raspberry Pi / SBC"; return ;;
+    *espressif*|*esp32*|*esp8266*|*tasmota*|*arduino*) echo "IoT / DIY embedded"; return ;;
+    *printer*|*jetdirect*|*laserjet*|*officejet*|*canon*|*epson*|*brother*) echo "Printer / MFP"; return ;;
+    *hikvision*|*dahua*|*axis*|*reolink*|*amcrest*|*camera*|*nvr*) echo "Camera / NVR"; return ;;
+    *iphone*|*ipad*) echo "Apple iOS device"; return ;;
+    *android*) echo "Android / mobile device"; return ;;
+    *windows*|*msft*) echo "Windows host"; return ;;
+    *macos*|*darwin*|*apple*|*macbook*) echo "Apple / macOS host"; return ;;
+    *ubuntu*|*debian*|*linux*|*dhcpcd*|*udhcp*) echo "Linux host"; return ;;
+  esac
+
+  case "$ports" in
+    *,9100,*|*,515,*|*,631,*) echo "Printer / MFP"; return ;;
+    *,554,*) echo "Camera / RTSP device"; return ;;
+    *,445,*|*,3389,*) echo "Windows-like host"; return ;;
+    *,22,*) echo "Linux/Unix-like host"; return ;;
+  esac
+
+  echo "Unknown / verify manually"
+}
+
+# ------------------------------ SETUP ---------------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Direct Host Profiler"
+SCREEN_WRITE "Connect target device"
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+
+if ! have nmap; then
+  LED FAIL
+  SCREEN_WRITE "nmap missing"
+  echo "FAILED: nmap missing" > "$REPORT"
+  ALERT "nmap missing" 8 2>/dev/null
+  exit 1
+fi
+
+# ------------------------------ LINK ----------------------------------------
+LED SPECIAL
+ip link set eth0 up 2>/dev/null
+
+LINK="DOWN"
+for _ in $(seq 1 "$LINK_WAIT_SECS"); do
+  LINK=$(get_link_state)
+  [ "$LINK" = "UP" ] && break
+  sleep 1
+done
+
+SPEED=$(get_speed)
+DUPLEX=$(get_duplex)
+
+if [ "$LINK" != "UP" ]; then
+  LED FAIL
+  SCREEN_WRITE "Link: DOWN"
+  {
+    echo "=========================================================="
+    echo " SHARK JACK DISPLAY - DIRECT HOST PROFILER"
+    echo "=========================================================="
+    echo " Result : FAIL"
+    echo " Reason : no physical link detected"
+    echo "=========================================================="
+  } > "$REPORT"
+  ALERT "Direct Host: no link" 8 2>/dev/null
+  exit 0
+fi
+
+SCREEN_WRITE "Link: ${SPEED:-?} ${DUPLEX:-?}"
+
+# --------------------------- DHCP SERVER ------------------------------------
+LED STAGE1
+SCREEN_WRITE "Starting DHCP server"
+
+# Start the passive capture FIRST so the DHCP handshake (hostname, vendor class,
+# assigned IP) and any mDNS/NetBIOS/LLMNR land in the pcap.
+PCAP="$RUN/passive.pcap"
+if have tcpdump; then
+  tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null &
+  TCPDUMP_PID=$!
+else
+  TCPDUMP_PID=""
+  echo "tcpdump missing; passive name capture skipped." > "$RUN/passive_skipped.txt"
+fi
+
+# Use the device's built-in DHCP server (serves the unit's config.txt subnet).
+# The Shark Jack has no uplink, so the client gets an address but no route off
+# the device: isolated by construction, no udhcpd/dnsmasq config needed.
+NETMODE DHCP_SERVER 2>/dev/null
+
+# Our server address on eth0, used to exclude ourselves when spotting the client.
+SJ_IP=""
+for _ in $(seq 1 10); do
+  SJ_IP=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | head -1 | cut -d/ -f1)
+  [ -n "$SJ_IP" ] && break
+  sleep 1
+done
+[ -z "$SJ_IP" ] && SJ_IP="-"
+
+# --------------------------- WAIT FOR CLIENT --------------------------------
+LED STAGE2
+SCREEN_WRITE "Waiting for client"
+
+CLIENT_IP=""
+CLIENT_MAC=""
+DHCP_HOSTNAME=""
+CLIENT_FOUND=0
+
+# The client ARPs us once it has a lease. On this isolated link the only other
+# neighbor is the target, so the first lladdr entry that is not our own is it.
+# `ip neigh show dev eth0` prints "IP lladdr MAC STATE", so the MAC is field 3.
+for _ in $(seq 1 "$CLIENT_WAIT_SECS"); do
+  CLIENT_IP=$(ip neigh show dev eth0 2>/dev/null | awk -v me="$SJ_IP" '/lladdr/ && $1!=me {print $1; exit}')
+  CLIENT_MAC=$(ip neigh show dev eth0 2>/dev/null | awk -v me="$SJ_IP" '/lladdr/ && $1!=me {print $3; exit}')
+  if [ -n "$CLIENT_IP" ]; then CLIENT_FOUND=1; break; fi
+  sleep 1
+done
+
+# Once a client is on, hold the capture open so noisy name protocols (mDNS,
+# NetBIOS, LLMNR) land in the pcap. No point waiting on a drop that never leased.
+[ "$CLIENT_FOUND" = "1" ] && sleep "$PASSIVE_LISTEN_SECS"
+
+[ -n "$TCPDUMP_PID" ] && kill "$TCPDUMP_PID" 2>/dev/null
+[ -n "$TCPDUMP_PID" ] && wait "$TCPDUMP_PID" 2>/dev/null
+
+# Fallback: if the client never populated the ARP table, recover the address it
+# was assigned straight from the DHCP ACK in the capture.
+if [ -z "$CLIENT_IP" ] && [ -s "$PCAP" ]; then
+  CLIENT_IP=$(tcpdump -nn -vv -r "$PCAP" '(udp port 67 or udp port 68)' 2>/dev/null \
+    | grep -ioE 'Your-IP [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -v '^0\.0\.0\.0' | head -1)
+  [ -n "$CLIENT_IP" ] && CLIENT_FOUND=1
+fi
+
+if [ -z "$CLIENT_IP" ]; then
+  LED FAIL
+  SCREEN_WRITE "No DHCP client"
+  {
+    echo "=========================================================="
+    echo " SHARK JACK DISPLAY - DIRECT HOST PROFILER"
+    echo "=========================================================="
+    echo " Result : LIMITED"
+    echo " Reason : link up, but no DHCP client appeared"
+    echo " Link   : ${SPEED:-unknown} Mbps ${DUPLEX:-unknown}"
+    echo " Note   : is the target a DHCP client? Statically-addressed"
+    echo "          hosts will not take a lease."
+    echo "=========================================================="
+  } > "$REPORT"
+  ALERT "Direct Host: no DHCP client" 8 2>/dev/null
+  exit 0
+fi
+
+SCREEN_WRITE "Client: $CLIENT_IP"
+
+# --------------------------- DECODE PASSIVE ---------------------------------
+DHCP_VENDOR=""
+DHCP_MAC=""
+if [ -s "$PCAP" ]; then
+  # -vv decodes DHCP options: Hostname (12), Vendor-Class (60), and the client
+  # ethernet address. Far more reliable than scraping strings from the pcap.
+  tcpdump -nn -e -vv -r "$PCAP" '(udp port 67 or udp port 68)' 2>/dev/null > "$RUN/dhcp_packets.txt"
+  tcpdump -nn -A -r "$PCAP" 'udp port 5353' 2>/dev/null > "$RUN/mdns_raw.txt"
+  tcpdump -nn -A -r "$PCAP" 'udp port 137 or udp port 138' 2>/dev/null > "$RUN/netbios_raw.txt"
+  tcpdump -nn -A -r "$PCAP" 'udp port 5355' 2>/dev/null > "$RUN/llmnr_raw.txt"
+
+  DHCP_HOSTNAME=$(grep -i 'Hostname Option' "$RUN/dhcp_packets.txt" 2>/dev/null | head -1 | sed 's/.*Hostname Option[^:]*: *//; s/^"//; s/".*$//')
+  DHCP_VENDOR=$(grep -i 'Option 60' "$RUN/dhcp_packets.txt" 2>/dev/null | head -1 | sed 's/.*Option 60[^:]*: *//; s/^"//; s/".*$//')
+  DHCP_MAC=$(grep -i 'Client-Ethernet-Address' "$RUN/dhcp_packets.txt" 2>/dev/null | head -1 | grep -oiE '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -1)
+
+  # Fallback only if the option decode came up empty.
+  [ -z "$DHCP_HOSTNAME" ] && DHCP_HOSTNAME=$(strings "$PCAP" 2>/dev/null | grep -E '^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$' | grep -viE '^(Microsoft|MSFT|dhcp|local|arpa)$' | head -1)
+
+  tcpdump -nn -r "$PCAP" 'udp port 5353' 2>/dev/null \
+    | grep -oE '[A-Za-z0-9._-]+\.local' | sort -u > "$RUN/mdns_names.txt"
+
+  tcpdump -nn -r "$PCAP" 'udp port 5355' 2>/dev/null \
+    | grep -oE '[A-Za-z0-9._-]+' | sort -u > "$RUN/llmnr_tokens.txt"
+else
+  : > "$RUN/mdns_names.txt"
+  : > "$RUN/llmnr_tokens.txt"
+fi
+
+MDNS_NAMES=$(tr '\n' ' ' < "$RUN/mdns_names.txt" 2>/dev/null)
+[ -z "$MDNS_NAMES" ] && MDNS_NAMES="-"
+# Prefer the MAC the client put on the wire if ARP/neigh did not give us one.
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC="$DHCP_MAC"
+
+# ------------------------------- SCAN HOST ----------------------------------
+LED STAGE3
+SCREEN_WRITE "Profiling host"
+CREATE_SPINNER "Scanning $CLIENT_IP"
+
+nmap -Pn $NMAP_TIMING --host-timeout "$HOST_TIMEOUT" -sV -O --osscan-guess \
+  --script http-title -p "$PORTSET" "$CLIENT_IP" \
+  -oN "$RUN/services.nmap" -oG "$RUN/services.gnmap" -oX "$RUN/services.xml" \
+  >/dev/null 2>&1
+
+# NetBIOS name service (UDP 137): names a Windows host even when its TCP surface
+# is uninformative, and returns the workgroup/domain. No-op on non-Windows hosts.
+NETBIOS_NAME=""
+nmap -Pn -sU -p137 --script nbstat --host-timeout "$HOST_TIMEOUT" "$CLIENT_IP" \
+  -oN "$RUN/nbstat.nmap" >/dev/null 2>&1
+NETBIOS_NAME=$(grep -i 'NetBIOS name:' "$RUN/nbstat.nmap" 2>/dev/null | head -1 | sed 's/.*NetBIOS name: *//; s/,.*$//')
+[ "$NETBIOS_NAME" = "<unknown>" ] && NETBIOS_NAME=""
+
+STOP_SPINNER
+
+OPEN_PORTS=$(awk '/^[0-9]+\/tcp[ \t]+open/{split($1,a,"/"); printf "%s/%s ",a[1],$3}' "$RUN/services.nmap" 2>/dev/null)
+OPEN_PORT_NUMS=$(awk '/^[0-9]+\/tcp[ \t]+open/{split($1,a,"/"); printf "%s,",a[1]}' "$RUN/services.nmap" 2>/dev/null | sed 's/,$//')
+HOSTNAME_NMAP=$(awk '/^Nmap scan report for /{
+  line=$0; sub(/^Nmap scan report for /,"",line);
+  if(line ~ /\(.*\)/){sub(/ \(.*/,"",line); print line; exit}
+}' "$RUN/services.nmap" 2>/dev/null)
+
+MAC_LINE=$(grep -m1 '^MAC Address:' "$RUN/services.nmap" 2>/dev/null)
+MAC_NMAP=$(echo "$MAC_LINE" | awk '{print $3}')
+VENDOR=$(echo "$MAC_LINE" | sed 's/^MAC Address: [^ ]* *//; s/[()]//g')
+[ -z "$CLIENT_MAC" ] && CLIENT_MAC="$MAC_NMAP"
+[ -z "$VENDOR" ] && VENDOR="Unknown"
+
+OS_GUESS=$(grep -m1 -E '^OS details:|^Running:|^Aggressive OS guesses:' "$RUN/services.nmap" 2>/dev/null | sed 's/^[^:]*: //')
+[ -z "$OS_GUESS" ] && OS_GUESS="-"
+
+# Name preference: DHCP Option 12, then NetBIOS, then nmap PTR/rDNS.
+DEVICE_NAME="$DHCP_HOSTNAME"
+[ -z "$DEVICE_NAME" ] && DEVICE_NAME="$NETBIOS_NAME"
+[ -z "$DEVICE_NAME" ] && DEVICE_NAME="$HOSTNAME_NMAP"
+[ -z "$DEVICE_NAME" ] && DEVICE_NAME="-"
+
+DEVICE_TYPE=$(guess_type "$VENDOR $DHCP_VENDOR" "$OS_GUESS" "$DEVICE_NAME $NETBIOS_NAME" "$MDNS_NAMES" "$OPEN_PORT_NUMS")
+
+# ------------------------------- REPORT -------------------------------------
+LED CLEANUP
+SCREEN_WRITE "Writing report"
+
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - DIRECT HOST PROFILER"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Loot     : $RUN"
+  echo ""
+  echo "---- RESULT ----------------------------------------------"
+  echo " Status   : COMPLETE"
+  echo " Purpose  : Direct-attached host identification only"
+  echo " Note     : Shark Jack provided DHCP but no routing/NAT."
+  echo ""
+  echo "---- LINK ------------------------------------------------"
+  echo " Link     : $LINK"
+  echo " Speed    : ${SPEED:-unknown} Mbps"
+  echo " Duplex   : ${DUPLEX:-unknown}"
+  echo ""
+  echo "---- TEMPORARY DHCP NETWORK ------------------------------"
+  echo " Server   : NETMODE DHCP_SERVER on eth0"
+  echo " Shark IP : ${SJ_IP:--}"
+  echo " Isolation: Shark Jack has no uplink, so the client has no route off it"
+  echo ""
+  echo "---- CLIENT IDENTITY -------------------------------------"
+  echo " Device name    : ${DEVICE_NAME:--}"
+  echo " Device type    : ${DEVICE_TYPE:--}"
+  echo " IP             : ${CLIENT_IP:--}"
+  echo " MAC            : ${CLIENT_MAC:--}"
+  echo " Vendor (OUI)   : ${VENDOR:--}"
+  echo " DHCP hostname  : ${DHCP_HOSTNAME:--}"
+  echo " DHCP vendor    : ${DHCP_VENDOR:--}"
+  echo " NetBIOS name   : ${NETBIOS_NAME:--}"
+  echo " Nmap hostname  : ${HOSTNAME_NMAP:--}"
+  echo " mDNS names     : ${MDNS_NAMES:--}"
+  echo " OS guess       : ${OS_GUESS:--}"
+  echo ""
+  echo "---- OPEN PORTS ------------------------------------------"
+  if [ -n "$OPEN_PORTS" ]; then
+    awk '/^[0-9]+\/tcp[ \t]+open/{print " " $0}' "$RUN/services.nmap"
+  else
+    echo " No open TCP ports found in configured PORTSET."
+  fi
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " passive.pcap"
+  echo " dhcp_packets.txt"
+  echo " mdns_raw.txt / mdns_names.txt"
+  echo " netbios_raw.txt / nbstat.nmap"
+  echo " llmnr_raw.txt / llmnr_tokens.txt"
+  echo " services.nmap / services.gnmap / services.xml"
+  echo "=========================================================="
+} > "$REPORT"
+
+# ------------------------------- DISPLAY ------------------------------------
+LED FINISH
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Direct Host: DONE"
+SCREEN_WRITE "IP: ${CLIENT_IP:--}"
+SCREEN_WRITE "MAC: ${CLIENT_MAC:--}"
+SCREEN_WRITE "Name: ${DEVICE_NAME:--}"
+SCREEN_WRITE "Type: ${DEVICE_TYPE:--}"
+SCREEN_WRITE "Ports: ${OPEN_PORTS:-none}"
+
+ALERT "Direct Host done: ${DEVICE_NAME:-unknown} ${CLIENT_IP:-no IP}" 12 2>/dev/null
+exit 0

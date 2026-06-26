@@ -1,0 +1,141 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Port ID Beacon (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      An unknown authorized wall jack you need to trace.
+#  Category:    recon (passive) / cable tracing
+#  Version:     1.0
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Plug into an unknown wall jack and read the switch and port off the OLED in
+#    seconds. It listens passively for one LLDP or CDP frame, which already names
+#    the switch and the exact port you are patched into, and shows:
+#        Switch: MDF-SW-01
+#        Port:   Gi1/0/47
+#    It stops the instant it has an answer, so it is usually near-instant; the
+#    wait only runs to its cap on a slow or CDP-only switch. Solves most of the
+#    "where does this cable actually go?" problem without a second device.
+#
+#  AUTHORIZATION
+#    Passive only: no probes, no scans, no DHCP. Run on networks you own or are
+#    contracted to assess. Minimal loot stays on-device in /root/loot.
+#
+#  REQUIRES tcpdump:  opkg update && opkg install tcpdump
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+WAIT_SECS=75                    # worst-case wait. LLDP beacons ~30s, CDP ~60s,
+                                # so 75s guarantees a cycle. It breaks early the
+                                # moment a frame is decoded, so this is a cap.
+POLL=2                          # how often to check the capture for a result
+LOOT_BASE="/root/loot/port_id"
+# ----------------------------------------------------------------------------
+
+# ============================ helpers =======================================
+have() { command -v "$1" >/dev/null 2>&1; }
+
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val); sub(/^Subtype[^:]*: /,"",val); print val; exit
+    }' "$1" 2>/dev/null
+}
+
+decode() {  # decode the current pcap into SWITCH/PORT (+ loot fields); sets globals
+  tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+  tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+  L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+  L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+  L_DESC=$(lldp_field "$RUN/lldp.txt" 'Port Description TLV')
+  L_MGMT=$(grep -i 'Management Address' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  C_DEV=$(grep -i 'Device-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  C_PORT=$(grep -i 'Port-ID'  "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  C_PLAT=$(grep -i 'Platform' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  SWITCH="${L_NAME:-$C_DEV}"
+  PORT="${L_PORT:-$C_PORT}"
+  SRC="LLDP"; [ -z "$L_NAME" ] && [ -z "$L_PORT" ] && [ -n "$C_DEV$C_PORT" ] && SRC="CDP"
+}
+# ============================================================================
+
+
+# ------------------------------ PHASE: SETUP --------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Port ID Beacon"
+
+if ! have tcpdump; then
+  LED FAIL
+  SCREEN_WRITE "tcpdump missing"
+  ALERT "Install tcpdump: opkg install tcpdump" 8 2>/dev/null
+  exit 1
+fi
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+PCAP="$RUN/capture.pcap"
+
+# Link up, no IP: passive only.
+ip link set eth0 up 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null
+
+
+# ---------------------------- PHASE: LISTEN ---------------------------------
+LED SPECIAL
+SCREEN_WRITE "Listening for LLDP/CDP"
+CREATE_SPINNER "Waiting for a frame"
+
+# Capture only LLDP (0x88cc) and CDP (Cisco multicast); poll and stop on first hit.
+tcpdump -i eth0 -s 0 -w "$PCAP" 'ether proto 0x88cc or ether host 01:00:0c:cc:cc:cc' 2>/dev/null &
+TPID=$!
+
+SWITCH=""; PORT=""; SRC=""
+elapsed=0
+while [ "$elapsed" -lt "$WAIT_SECS" ]; do
+  sleep "$POLL"; elapsed=$((elapsed + POLL))
+  [ -s "$PCAP" ] || continue
+  decode
+  [ -n "$SWITCH" ] || [ -n "$PORT" ] && break
+done
+
+kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+[ -s "$PCAP" ] && decode      # final decode in case a frame landed on the last tick
+STOP_SPINNER
+
+
+# --------------------------- PHASE: RESULT ----------------------------------
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - PORT ID BEACON"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Waited   : up to ${WAIT_SECS}s (stopped at ${elapsed}s)"
+  echo ""
+  echo " Switch   : ${SWITCH:-not advertised}"
+  echo " Port     : ${PORT:-not advertised}"
+  echo " Source   : ${SRC:--}"
+  echo " Port desc: ${L_DESC:--}"
+  echo " Platform : ${C_PLAT:--}"
+  echo " Mgmt IP  : ${L_MGMT:--}"
+  echo ""
+  echo " Raw decode: lldp.txt / cdp.txt   Capture: capture.pcap"
+  echo "=========================================================="
+} > "$REPORT"
+
+CLEAR_SCREEN 2>/dev/null
+if [ -n "$SWITCH" ] || [ -n "$PORT" ]; then
+  LED FINISH
+  SCREEN_WRITE "Switch: ${SWITCH:-unknown}"
+  SCREEN_WRITE "Port: ${PORT:-unknown}"
+  ALERT "Port ID: ${SWITCH:-?} ${PORT:-?}" 15 2>/dev/null
+else
+  LED FAIL
+  SCREEN_WRITE "No LLDP/CDP heard"
+  SCREEN_WRITE "in ${WAIT_SECS}s"
+  ALERT "No LLDP/CDP: unmanaged switch, or LLDP/CDP disabled" 12 2>/dev/null
+fi
+exit 0
