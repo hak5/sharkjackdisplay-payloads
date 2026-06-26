@@ -75,7 +75,7 @@ ping_sweep() {
 enumerate_network() {
   CREATE_SPINNER "Scanning..."
   
-  PORTS="21,22,53,88,135,139,389,443,445,3268,3269,3389,5985,5986,8080,9100"
+  PORTS="21,22,53,88,135,139,389,443,445,1337,3268,3269,3389,5985,5986,8000,8080,8081,8082,8090,8443,8888,9000,5000,3000,9100"
   nmap -sS -p $PORTS -sV "$CIDR" > "$SCAN_FILE" 2>&1
   
   STOP_SPINNER
@@ -370,52 +370,54 @@ spray_smb_all() {
 }
 
 spray_http_all() {
-  HTTP_TARGETS=$(get_targets_by_port "80")
-  
-  if [ -z "$HTTP_TARGETS" ]; then
-    log_both ""
-    log_both "HTTP Targets: None found"
-    log_both ""
-    return
-  fi
-  
-  log_both ""
-  log_both "HTTP Targets:"
-  log_both ""
+  # Scan multiple common HTTP/HTTPS ports
+  declare -a HTTP_PORTS=(80 1337 8080 8000 8888 3000 5000 9000 8443 443 8081 8082 8090)
   
   # Common default paths to check
-  declare -a DEFAULT_PATHS=("/admin" "/login" "/api" "/admin/login" "/wp-admin" "/administrator" "/phpmyadmin" "/console" "/panel" "/control" "/dashboard" "/.git" "/.env" "/config.php" "/web.config")
+  declare -a DEFAULT_PATHS=("/admin" "/login" "/api" "/admin/login" "/wp-admin" "/administrator" "/phpmyadmin" "/console" "/panel" "/control" "/dashboard" "/.git" "/.env" "/config.php" "/web.config" "/robots.txt" "/backup" "/uploads" "/download" "/test" "/dev" "/debug")
   
-  for ip in $HTTP_TARGETS; do
-    log_both ""
-    log_both "[$ip]"
-    log_both "  ✓ HTTP detected on port 80"
-    log_both ""
-    log_both "    Default Paths Found:"
+  for port in "${HTTP_PORTS[@]}"; do
+    HTTP_TARGETS=$(get_targets_by_port "$port")
     
-    found_paths=0
-    for path in "${DEFAULT_PATHS[@]}"; do
-      code=$(timeout 2 curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://$ip$path" 2>/dev/null)
-      
-      # Log any path that doesn't return 404 or connection error
-      if [ -n "$code" ] && [ "$code" != "404" ] && [ "$code" != "000" ]; then
-        log_both "      - $path (HTTP $code)"
-        found_paths=$((found_paths + 1))
-      fi
-    done
-    
-    if [ $found_paths -eq 0 ]; then
-      log_both "      - No common paths found"
+    if [ -z "$HTTP_TARGETS" ]; then
+      continue
     fi
     
     log_both ""
-    log_both "    Post-Recon Next Steps:"
-    log_both "      1. Enumerate with dirbuster/ffuf: ffuf -w wordlist.txt -u http://$ip/FUZZ"
-    log_both "      2. Check robots.txt: curl http://$ip/robots.txt"
-    log_both "      3. Identify CMS: whatweb http://$ip"
-    log_both "      4. Screenshot: cutycapt --url=http://$ip --out=/tmp/$ip.png"
-    log_both "      5. Brute force forms: hydra -l admin -P pass.txt http://$ip/ -V"
+    log_both "HTTP Targets (Port $port):"
     log_both ""
+    
+    for ip in $HTTP_TARGETS; do
+      log_both ""
+      log_both "[$ip:$port]"
+      log_both "  ✓ HTTP detected on port $port"
+      log_both ""
+      log_both "    Default Paths Found:"
+      
+      found_paths=0
+      for path in "${DEFAULT_PATHS[@]}"; do
+        code=$(timeout 2 curl -s -o /dev/null -w "%{http_code}" --max-time 2 "http://$ip:$port$path" 2>/dev/null)
+        
+        # Log any path that doesn't return 404 or connection error
+        if [ -n "$code" ] && [ "$code" != "404" ] && [ "$code" != "000" ]; then
+          log_both "      - $path (HTTP $code)"
+          found_paths=$((found_paths + 1))
+        fi
+      done
+      
+      if [ $found_paths -eq 0 ]; then
+        log_both "      - No common paths found"
+      fi
+      
+      log_both ""
+      log_both "    Post-Recon Next Steps:"
+      log_both "      1. Enumerate with dirbuster/ffuf: ffuf -w wordlist.txt -u http://$ip:$port/FUZZ"
+      log_both "      2. Check robots.txt: curl http://$ip:$port/robots.txt"
+      log_both "      3. Identify CMS: whatweb http://$ip:$port"
+      log_both "      4. Screenshot: cutycapt --url=http://$ip:$port --out=/tmp/$ip:$port.png"
+      log_both "      5. Brute force forms: hydra -l admin -P pass.txt http://$ip:$port/ -V"
+      log_both ""
+    done
   done
 }
 
