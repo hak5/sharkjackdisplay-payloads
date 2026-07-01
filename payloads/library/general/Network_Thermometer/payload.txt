@@ -1,0 +1,176 @@
+#!/bin/bash
+
+# Title: Network Thermometer
+# Description: Humorous network health simulator using actual connectivity diagnostics
+# Author: CoulsTech
+# Props: Ser0ka, Hackazillarex, Hak5Darren
+
+DNS_HOST="google.com"
+INTERNET_HOST="1.1.1.1"
+INTERNET_URL="https://hak5.org/"
+
+HEALTHY_RESULT() {
+local results=(
+"98.6F Healthy"
+"98.4F Normal"
+"98.8F Stable"
+"98.7F Operational"
+"98.5F Link Detected"
+)
+
+echo "${results[$RANDOM % ${#results[@]}]}"
+}
+
+DNS_RESULT() {
+local results=(
+"100.5F It's Always DNS"
+)
+
+echo "${results[$RANDOM % ${#results[@]}]}"
+}
+
+INTERNET_RESULT() {
+local results=(
+"102.8F No Internet"
+"103.2F Elevated Latency"
+"103.5F Gateway Distress"
+"104.0F Connectivity Fever"
+)
+
+echo "${results[$RANDOM % ${#results[@]}]}"
+}
+
+LINK_RESULT() {
+local results=(
+"104.8F No Link"
+"105.5F Cable Missing"
+"106.0F Link Failure"
+"107.0F Flatlined"
+)
+
+echo "${results[$RANDOM % ${#results[@]}]}"
+}
+
+CRITICAL_RESULT() {
+local results=(
+"105.0F Critical"
+"106.2F Network Failure"
+"107.0F Flatlined"
+"108.6F Call IT"
+"110.0F Cable Missing"
+)
+
+echo "${results[$RANDOM % ${#results[@]}]}"
+}
+
+SCREEN_WRITE "Network Thermometer"
+sleep 1
+
+resp="$(CONFIRMATION_DIALOG "Take temperature?" "Start")"
+
+if [ "$resp" != "Start" ]; then
+SCREEN_WRITE "Aborted"
+exit 0
+fi
+
+SCREEN_WRITE "Preparing exam..."
+sleep 1
+
+MODE="$(GET_NETMODE)"
+
+if [ "$MODE" = "OFF" ]; then
+SCREEN_WRITE "Patient deceased"
+sleep 2
+
+SCREEN_WRITE "107.0F Flatlined"
+sleep 2
+
+SCREEN_WRITE "No network detected"
+sleep 2
+
+exit 0
+fi
+
+CREATE_SPINNER "Checking vitals..."
+
+# Initialize CONNECTION variable
+CONNECTION="Unknown"
+
+if [ "$MODE" = "OFF" ]; then
+CONNECTION="No Link"
+elif ! nslookup "$DNS_HOST" >/dev/null 2>&1; then
+CONNECTION="No DNS"
+elif ! ping -c 1 -W 2 "$INTERNET_HOST" >/dev/null 2>&1; then
+CONNECTION="No Internet"
+elif ! curl -k -s --connect-timeout 3 "$INTERNET_URL" >/dev/null 2>&1; then
+CONNECTION="No Internet"
+else
+CONNECTION="Connected"
+fi
+
+STOP_SPINNER
+
+case "$CONNECTION" in
+
+"Connected")
+    RESULT="$(HEALTHY_RESULT)"
+    DIAGNOSIS="Healthy Network"
+    PRESCRIPTION="Continue Hacking"
+    ;;
+
+"No Link")
+    RESULT="$(LINK_RESULT)"
+    DIAGNOSIS="Physical Link Failure"
+    PRESCRIPTION="Check Cable"
+    ;;
+
+"No DNS")
+    RESULT="$(DNS_RESULT)"
+    DIAGNOSIS="DNS Symptoms"
+    PRESCRIPTION="Administer DNS"
+    ;;
+
+"No Internet")
+    RESULT="$(INTERNET_RESULT)"
+    DIAGNOSIS="Connectivity Fever"
+    PRESCRIPTION="Check Gateway"
+    ;;
+
+*)
+    RESULT="$(CRITICAL_RESULT)"
+    DIAGNOSIS="Critical Condition"
+    PRESCRIPTION="Call Network Team"
+    ;;
+esac
+
+SCREEN_WRITE "$RESULT"
+sleep 2
+
+SCREEN_WRITE "$DIAGNOSIS"
+sleep 2
+
+SCREEN_WRITE "Prescription:"
+sleep 1
+
+SCREEN_WRITE "$PRESCRIPTION"
+sleep 2
+
+SCREEN_WRITE "Warning:"
+sleep 1
+
+SCREEN_WRITE "Not FDA Approved"
+sleep 2
+
+SCREEN_WRITE "Do not insert"
+sleep 2
+
+SCREEN_WRITE "Into patients"
+sleep 2
+
+resp="$(CONFIRMATION_DIALOG "Retake temp?" "Restart")"
+
+if [ "$resp" = "Restart" ]; then
+exec "$0"
+fi
+
+exit 0
