@@ -1,0 +1,623 @@
+#!/bin/bash
+# ============================================================================
+#  Title:       Jack Survey / Drop Validator (Shark Jack Display)
+#  Author:      Brent Mills
+#  Target:      A single authorized wired wall jack / drop to validate.
+#  Category:    recon / admin / site-survey / troubleshooting
+#  Version:     1.1
+#  Firmware:    Tested on Shark Jack Display 1.0.1
+# ----------------------------------------------------------------------------
+#  WHAT IT DOES
+#    Validates one Ethernet wall jack end to end and answers the four
+#    questions a site survey actually needs:
+#      - Does this port work? .. carrier, negotiated speed/duplex.
+#      - Where does it go? ..... LLDP/CDP switch name, model, and the PORT
+#                                you are patched into; switch management IP.
+#      - What VLAN is it? ...... VLAN advertised by LLDP/CDP, with the access
+#                                subnet CIDR as a fallback hint.
+#      - Can users use it? ..... DHCP lease, gateway, DNS, and HTTP/HTTPS
+#                                reachability out to the internet.
+#    Optionally compares what it observes against EXPECTED_* values to flag a
+#    mispatched drop (wrong switch / port / VLAN / subnet), then writes a site-
+#    survey report plus raw artifacts to loot.
+#
+#  AUTHORIZATION
+#    Mostly passive, plus a DHCP request and a few small outbound reachability
+#    probes to INTERNET_TEST_HOST. Run on networks you own or are contracted to
+#    assess, within the agreed scope and time window. Nothing is exfiltrated:
+#    all output stays on-device in /root/loot until you pull it.
+# ============================================================================
+
+# ------------------------------- CONFIG -------------------------------------
+LINK_WAIT_SECS=20
+DHCP_WAIT_SECS=30
+PASSIVE_LISTEN_SECS=90
+INTERNET_TEST_HOST="example.com"
+LOOT_BASE="/root/loot/jack_survey"
+
+# Optional expected values. Leave blank for generic survey mode.
+EXPECTED_SWITCH=""
+EXPECTED_PORT=""
+EXPECTED_VLAN=""
+EXPECTED_CIDR=""
+EXPECTED_SPEED_MIN="1000"       # Mbps. Empty disables speed check.
+EXPECTED_DUPLEX="full"          # full/half. Empty disables duplex check.
+
+# VLAN visibility / reachability. This is a DIAGNOSTIC, not a scanner: it tells
+# you which VLANs this jack can see and reach, never what lives on them.
+#   - Visibility is free and always on: tagged 802.1Q frames in the passive
+#     capture mean the port is really a trunk (an access port strips tags).
+#   - Reachability is opt-in: for each VLAN it tags onto eth0.<vid>, tries a
+#     short DHCP lease, notes CIDR/gateway, pings the gateway once, tears down.
+#     No host or port scanning of the other VLAN. Authorized scope only.
+PROBE_VLAN_REACH=0              # 1 = actively test which VLANs are reachable
+VLAN_PROBE_IDS=""              # extra VIDs to test even if not seen, e.g. "99 200"
+VLAN_DHCP_WAIT=6               # per-VLAN DHCP timeout (s) during the reach probe
+# ----------------------------------------------------------------------------
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+ip_to_int() { local IFS=.; set -- $1; echo $(( ($1<<24)|($2<<16)|($3<<8)|$4 )); }
+int_to_ip() { local i=$1; echo "$(((i>>24)&255)).$(((i>>16)&255)).$(((i>>8)&255)).$((i&255))"; }
+mask_for()  { local p=$1; echo $(( (0xFFFFFFFF << (32-p)) & 0xFFFFFFFF )); }
+network_cidr() {
+  local ip=$1 p=$2 m
+  [ -z "$ip" ] || [ -z "$p" ] && return
+  m=$(mask_for "$p")
+  echo "$(int_to_ip $(( $(ip_to_int "$ip") & m )))/$p"
+}
+
+# Tagged VLAN IDs observed in the passive capture. A normal access port strips
+# 802.1Q tags, so anything here means the port is actually a trunk. <pcap>
+vlans_in_pcap() {
+  tcpdump -e -nn -r "$1" vlan 2>/dev/null \
+    | grep -oE 'vlan [0-9]+' | awk '{print $2}' | sort -un | tr '\n' ' '
+}
+
+get_link_state() {
+  cat /sys/class/net/eth0/carrier 2>/dev/null | grep -q 1 && echo "UP" || echo "DOWN"
+}
+
+get_speed() {
+  cat /sys/class/net/eth0/speed 2>/dev/null
+}
+
+get_duplex() {
+  cat /sys/class/net/eth0/duplex 2>/dev/null | tr 'A-Z' 'a-z'
+}
+
+lldp_field() {
+  awk -v lbl="$2" '
+    index($0,lbl) {
+      rest=substr($0,index($0,lbl)); val=""
+      if (match(rest,/: /)) val=substr(rest,RSTART+2)
+      if (val ~ /^[ \t]*$/) getline val
+      gsub(/^[ \t]+|[ \t]+$/,"",val)
+      sub(/^Subtype[^:]*: /,"",val)
+      print val
+      exit
+    }' "$1" 2>/dev/null
+}
+
+dhcp_field() {
+  grep -iE "$2" "$1" 2>/dev/null | head -1 | sed 's/^[^:]*: *//' | sed 's/^[ \t|]*//; s/[ \t]*$//'
+}
+
+contains_ci() {
+  echo "$1" | tr 'A-Z' 'a-z' | grep -q "$(echo "$2" | tr 'A-Z' 'a-z')"
+}
+
+record_check() {
+  # record_check <status> <label> <detail>
+  printf "%s\t%s\t%s\n" "$1" "$2" "$3" >> "$RUN/checks.tsv"
+}
+
+# ------------------------------ SETUP ---------------------------------------
+LED SETUP
+CLEAR_SCREEN 2>/dev/null
+SCREEN_WRITE "Jack Survey"
+SCREEN_WRITE "Waiting for link"
+
+RUN="$LOOT_BASE/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)_$$"
+mkdir -p "$RUN"
+REPORT="$RUN/summary.txt"
+: > "$RUN/checks.tsv"
+
+ip link set eth0 up 2>/dev/null
+
+# ------------------------------ LINK ----------------------------------------
+LED SPECIAL
+LINK="DOWN"
+
+for _ in $(seq 1 "$LINK_WAIT_SECS"); do
+  LINK=$(get_link_state)
+  [ "$LINK" = "UP" ] && break
+  sleep 1
+done
+
+SPEED=$(get_speed)
+DUPLEX=$(get_duplex)
+
+if [ "$LINK" = "UP" ]; then
+  record_check "PASS" "Physical link" "Carrier detected"
+else
+  record_check "FAIL" "Physical link" "No carrier detected"
+fi
+
+if [ -n "$EXPECTED_SPEED_MIN" ] && [ -n "$SPEED" ] && [ "$SPEED" -gt 0 ] 2>/dev/null; then
+  if [ "$SPEED" -ge "$EXPECTED_SPEED_MIN" ]; then
+    record_check "PASS" "Speed" "${SPEED} Mbps >= expected ${EXPECTED_SPEED_MIN} Mbps"
+  else
+    record_check "WARN" "Speed" "${SPEED} Mbps < expected ${EXPECTED_SPEED_MIN} Mbps"
+  fi
+fi
+
+if [ -n "$EXPECTED_DUPLEX" ] && [ -n "$DUPLEX" ]; then
+  if [ "$DUPLEX" = "$EXPECTED_DUPLEX" ]; then
+    record_check "PASS" "Duplex" "$DUPLEX"
+  else
+    record_check "WARN" "Duplex" "observed $DUPLEX, expected $EXPECTED_DUPLEX"
+  fi
+fi
+
+if [ "$LINK" != "UP" ]; then
+  LED FAIL
+  SCREEN_WRITE "Link: DOWN"
+  SCREEN_WRITE "No carrier"
+
+  {
+    echo "=========================================================="
+    echo " SHARK JACK DISPLAY - JACK SURVEY / DROP VALIDATOR"
+    echo "=========================================================="
+    echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+    echo ""
+    echo "---- PHYSICAL LINK ---------------------------------------"
+    echo " Link   : DOWN"
+    echo " Speed  : unknown"
+    echo " Duplex : unknown"
+    echo ""
+    echo "---- RESULT ----------------------------------------------"
+    echo " Status : FAIL"
+    echo " Reason : no physical link detected"
+    echo " Action : check patch panel, switch port, cable, or jack termination"
+    echo "=========================================================="
+  } > "$REPORT"
+
+  ALERT "Jack Survey FAIL: no link" 8 2>/dev/null
+  exit 0
+fi
+
+SCREEN_WRITE "Link: UP"
+SCREEN_WRITE "${SPEED:-?} Mbps ${DUPLEX:-?}"
+
+# --------------------------- PASSIVE DISCOVERY -------------------------------
+L_NAME="-"; L_PORT="-"; L_DESC="-"; L_MGMT="-"; L_VLAN="-"
+C_DEV="-"; C_PLAT="-"; C_PORT="-"; C_NVLAN="-"; C_ADDR="-"
+DHCP_SRV_SEEN="-"; STP_SEEN="not seen"; ARPN=0
+
+if have tcpdump; then
+  LED STAGE1
+  SCREEN_WRITE "Passive discovery"
+  CREATE_SPINNER "LLDP/CDP/DHCP"
+
+  PCAP="$RUN/passive.pcap"
+  timeout "${PASSIVE_LISTEN_SECS}s" tcpdump -i eth0 -s 0 -w "$PCAP" 2>/dev/null
+
+  tcpdump -nn -v -r "$PCAP" 'ether proto 0x88cc' 2>/dev/null > "$RUN/lldp.txt"
+  tcpdump -nn -v -r "$PCAP" 'ether host 01:00:0c:cc:cc:cc' 2>/dev/null > "$RUN/cdp.txt"
+
+  L_NAME=$(lldp_field "$RUN/lldp.txt" 'System Name TLV')
+  L_PORT=$(lldp_field "$RUN/lldp.txt" 'Port ID TLV')
+  L_DESC=$(lldp_field "$RUN/lldp.txt" 'System Description TLV')
+  L_MGMT=$(grep -i 'Management Address' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  L_VLAN=$(grep -iE 'PVID|Port VLAN ID' "$RUN/lldp.txt" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+
+  C_DEV=$(grep -i 'Device-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  C_PLAT=$(grep -i 'Platform' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  C_PORT=$(grep -i 'Port-ID' "$RUN/cdp.txt" 2>/dev/null | head -1 | sed "s/.*: '//; s/'.*//")
+  C_NVLAN=$(grep -i 'Native VLAN' "$RUN/cdp.txt" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1)
+  C_ADDR=$(grep -iA2 'Address' "$RUN/cdp.txt" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+  tcpdump -nn -e -r "$PCAP" arp 2>/dev/null | awk '
+    {
+      mac=""
+      for (i=1;i<=NF;i++) if (mac=="" && $i ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) mac=$i
+      for (i=1;i<=NF;i++) {
+        if ($i=="tell")  { ip=$(i+1); gsub(/[,:]$/,"",ip); if (ip ~ /^[0-9]+\./ && mac!="") print ip"\t"mac }
+        if ($i=="is-at") { ip=$(i-1); gsub(/[,:]$/,"",ip); m=$(i+1); gsub(/[,:]$/,"",m); if (ip ~ /^[0-9]+\./ && m ~ /:/) print ip"\t"m }
+      }
+    }' | sort -u > "$RUN/arp_hosts.tsv"
+
+  ARPN=$(wc -l < "$RUN/arp_hosts.tsv" 2>/dev/null | tr -d ' ')
+  [ -z "$ARPN" ] && ARPN=0
+
+  DHCP_SRV_SEEN=$(tcpdump -nn -r "$PCAP" '(udp port 67 or udp port 68)' 2>/dev/null \
+    | grep -oiE 'Server-ID Option[^,]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ')
+  [ -z "$DHCP_SRV_SEEN" ] && DHCP_SRV_SEEN="-"
+
+  STP_TMP=$(tcpdump -nn -r "$PCAP" 'stp' 2>/dev/null | head -1)
+  [ -n "$STP_TMP" ] && STP_SEEN="present"
+
+  STOP_SPINNER
+else
+  echo "tcpdump not installed; passive LLDP/CDP discovery skipped." > "$RUN/passive_skipped.txt"
+  record_check "WARN" "Passive discovery" "tcpdump missing; LLDP/CDP skipped"
+fi
+
+SWITCH="${L_NAME:-$C_DEV}"
+PORT="${L_PORT:-$C_PORT}"
+OBS_VLAN="${L_VLAN:-$C_NVLAN}"
+MGMT="${L_MGMT:-$C_ADDR}"
+
+[ -n "$SWITCH" ] && [ "$SWITCH" != "-" ] && record_check "PASS" "Switch identity" "$SWITCH" || record_check "INFO" "Switch identity" "not advertised"
+[ -n "$PORT" ] && [ "$PORT" != "-" ] && record_check "PASS" "Switch port" "$PORT" || record_check "INFO" "Switch port" "not advertised"
+[ -n "$OBS_VLAN" ] && [ "$OBS_VLAN" != "-" ] && record_check "PASS" "VLAN advertised" "$OBS_VLAN" || record_check "INFO" "VLAN advertised" "not advertised"
+
+# ------------------------------- DHCP ---------------------------------------
+LED STAGE2
+SCREEN_WRITE "DHCP request"
+NETMODE DHCP_CLIENT 2>/dev/null
+WAIT_FOR_LINK 2>/dev/null
+
+DHCP_START=$(date +%s 2>/dev/null)
+IP=""; PREFIX=""
+
+for _ in $(seq 1 "$DHCP_WAIT_SECS"); do
+  line=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | head -1)
+  if [ -n "$line" ]; then
+    IP=${line%/*}
+    PREFIX=${line#*/}
+    break
+  fi
+  sleep 1
+done
+
+DHCP_END=$(date +%s 2>/dev/null)
+DHCP_SECS=$((DHCP_END - DHCP_START))
+
+GATEWAY=$(ip route 2>/dev/null | awk '/default/{print $3; exit}')
+CIDR=$(network_cidr "$IP" "$PREFIX")
+DNS=$(grep -h nameserver /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' ')
+DOMAIN=$(grep -hE '^(search|domain)' /tmp/resolv.conf.auto /etc/resolv.conf 2>/dev/null | awk '{print $2}' | head -1)
+
+DHCP_RESULT="FAILED"
+[ -n "$IP" ] && DHCP_RESULT="SUCCESS"
+
+if [ "$DHCP_RESULT" = "SUCCESS" ]; then
+  record_check "PASS" "DHCP" "$IP/$PREFIX in ${DHCP_SECS}s"
+  SCREEN_WRITE "DHCP: OK"
+  SCREEN_WRITE "$IP/$PREFIX"
+else
+  record_check "WARN" "DHCP" "No lease after ${DHCP_WAIT_SECS}s"
+  SCREEN_WRITE "DHCP: FAILED"
+fi
+
+DHCP_SERVER="$DHCP_SRV_SEEN"
+LEASE="-"; NTP="-"; TFTP="-"; WPAD="-"
+
+if have nmap; then
+  nmap --script broadcast-dhcp-discover -e eth0 2>/dev/null > "$RUN/dhcp.txt"
+  DHCP_SERVER_NMAP=$(dhcp_field "$RUN/dhcp.txt" 'Server Identifier|DHCP Server Identifier')
+  [ -n "$DHCP_SERVER_NMAP" ] && DHCP_SERVER="$DHCP_SERVER_NMAP"
+  LEASE=$(dhcp_field "$RUN/dhcp.txt" 'Lease Time')
+  NTP=$(dhcp_field "$RUN/dhcp.txt" 'NTP Server')
+  TFTP=$(dhcp_field "$RUN/dhcp.txt" 'TFTP|Bootfile|Boot File')
+  WPAD=$(dhcp_field "$RUN/dhcp.txt" 'WPAD|Proxy')
+else
+  echo "nmap not installed; detailed DHCP discover skipped." > "$RUN/dhcp_skipped.txt"
+  record_check "INFO" "DHCP details" "nmap missing; full offer not collected"
+fi
+
+# -------------------------- EXPECTED VALUE CHECKS ----------------------------
+if [ -n "$EXPECTED_SWITCH" ]; then
+  if [ -n "$SWITCH" ] && [ "$SWITCH" != "-" ] && contains_ci "$SWITCH" "$EXPECTED_SWITCH"; then
+    record_check "PASS" "Expected switch" "observed $SWITCH"
+  else
+    record_check "MISMATCH" "Expected switch" "expected $EXPECTED_SWITCH, observed ${SWITCH:--}"
+  fi
+fi
+
+if [ -n "$EXPECTED_PORT" ]; then
+  if [ -n "$PORT" ] && [ "$PORT" != "-" ] && contains_ci "$PORT" "$EXPECTED_PORT"; then
+    record_check "PASS" "Expected port" "observed $PORT"
+  else
+    record_check "MISMATCH" "Expected port" "expected $EXPECTED_PORT, observed ${PORT:--}"
+  fi
+fi
+
+if [ -n "$EXPECTED_VLAN" ]; then
+  if [ -n "$OBS_VLAN" ] && [ "$OBS_VLAN" = "$EXPECTED_VLAN" ]; then
+    record_check "PASS" "Expected VLAN" "observed $OBS_VLAN"
+  elif [ -n "$OBS_VLAN" ] && [ "$OBS_VLAN" != "-" ]; then
+    record_check "MISMATCH" "Expected VLAN" "expected $EXPECTED_VLAN, observed $OBS_VLAN"
+  else
+    record_check "WARN" "Expected VLAN" "expected $EXPECTED_VLAN, but VLAN not advertised on this access port"
+  fi
+fi
+
+if [ -n "$EXPECTED_CIDR" ]; then
+  if [ -n "$CIDR" ] && [ "$CIDR" = "$EXPECTED_CIDR" ]; then
+    record_check "PASS" "Expected CIDR" "observed $CIDR"
+  else
+    record_check "MISMATCH" "Expected CIDR" "expected $EXPECTED_CIDR, observed ${CIDR:--}"
+  fi
+fi
+
+# --------------------------- INTERNET TESTS ---------------------------------
+DNS_RESULT="not tested"
+HTTPS_RESULT="not tested"
+HTTP_RESULT="not tested"
+
+if [ -n "$IP" ]; then
+  LED STAGE3
+  SCREEN_WRITE "Internet tests"
+
+  if have nslookup; then
+    nslookup "$INTERNET_TEST_HOST" > "$RUN/dns_test.txt" 2>&1
+    grep -qiE 'Address|Name:' "$RUN/dns_test.txt" && DNS_RESULT="PASS" || DNS_RESULT="FAIL"
+  else
+    echo "nslookup missing" > "$RUN/dns_test.txt"
+    DNS_RESULT="unknown"
+  fi
+
+  if have wget; then
+    wget -q --spider --timeout=8 "https://$INTERNET_TEST_HOST" > "$RUN/https_test.txt" 2>&1
+    [ "$?" -eq 0 ] && HTTPS_RESULT="PASS" || HTTPS_RESULT="FAIL"
+    wget -q --spider --timeout=8 "http://$INTERNET_TEST_HOST" > "$RUN/http_test.txt" 2>&1
+    [ "$?" -eq 0 ] && HTTP_RESULT="PASS" || HTTP_RESULT="FAIL"
+  elif have curl; then
+    curl -Is -m 8 "https://$INTERNET_TEST_HOST" > "$RUN/https_test.txt" 2>&1
+    [ "$?" -eq 0 ] && HTTPS_RESULT="PASS" || HTTPS_RESULT="FAIL"
+    curl -Is -m 8 "http://$INTERNET_TEST_HOST" > "$RUN/http_test.txt" 2>&1
+    [ "$?" -eq 0 ] && HTTP_RESULT="PASS" || HTTP_RESULT="FAIL"
+  else
+    echo "wget/curl missing" > "$RUN/http_https_skipped.txt"
+    HTTPS_RESULT="unknown"
+    HTTP_RESULT="unknown"
+  fi
+
+  [ "$DNS_RESULT" = "PASS" ] && record_check "PASS" "DNS resolution" "$INTERNET_TEST_HOST" || record_check "WARN" "DNS resolution" "$DNS_RESULT"
+  if [ "$HTTPS_RESULT" = "PASS" ] || [ "$HTTP_RESULT" = "PASS" ]; then
+    record_check "PASS" "Internet reachability" "HTTPS=$HTTPS_RESULT HTTP=$HTTP_RESULT"
+  else
+    record_check "WARN" "Internet reachability" "HTTPS=$HTTPS_RESULT HTTP=$HTTP_RESULT"
+  fi
+fi
+
+# ---------------------- VLAN VISIBILITY / REACHABILITY ----------------------
+# Passive visibility (free): tagged VLANs in the capture == this jack is a trunk,
+# not the access port it may be documented as. Optional reach probe: tag onto
+# each VLAN, see if a lease/gateway answers. No host or port scanning either way.
+VLANS_SEEN="-"
+PORT_MODE="access (no tagged VLANs visible)"
+REACH_VLANS="-"
+: > "$RUN/vlan_reach.txt"
+
+if [ -s "$PCAP" ] && have tcpdump; then
+  VLANS_SEEN=$(vlans_in_pcap "$PCAP")
+  [ -z "$VLANS_SEEN" ] && VLANS_SEEN="-"
+fi
+
+if [ "$VLANS_SEEN" != "-" ]; then
+  PORT_MODE="trunk (tagged VLANs visible)"
+  record_check "INFO" "Port mode" "trunk - tagged VLANs visible: $VLANS_SEEN"
+else
+  record_check "INFO" "Port mode" "access - no tagged VLANs visible"
+fi
+
+if [ "$PROBE_VLAN_REACH" = "1" ]; then
+  LED STAGE4
+  SCREEN_WRITE "VLAN reach probe"
+  if have ip && have udhcpc; then
+    CREATE_SPINNER "Tagging VLANs (no scan)"
+    lsmod 2>/dev/null | grep -q 8021q || modprobe 8021q 2>/dev/null
+    # Restore eth0's default route afterwards: udhcpc on a sub-iface repoints it.
+    ORIG_DEFAULT=$(ip route show default 2>/dev/null | head -1)
+    PROBE_IDS=$(printf '%s %s\n' "$VLANS_SEEN" "$VLAN_PROBE_IDS" \
+                | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')
+    REACHED=""
+    if [ -z "$PROBE_IDS" ]; then
+      record_check "INFO" "VLAN reachability" "no candidate VLANs to probe"
+    else
+      for vid in $PROBE_IDS; do
+        ip link add link eth0 name "eth0.$vid" type vlan id "$vid" 2>/dev/null
+        if ! ip link show "eth0.$vid" >/dev/null 2>&1; then
+          echo " VLAN $vid : no 802.1Q sub-interface (kernel refused tag)" >> "$RUN/vlan_reach.txt"
+          continue
+        fi
+        ip link set "eth0.$vid" up 2>/dev/null
+        udhcpc -i "eth0.$vid" -n -q -t 3 -T "$VLAN_DHCP_WAIT" >/dev/null 2>&1
+        vline=$(ip -o -4 addr show "eth0.$vid" 2>/dev/null | awk '{print $4}' | head -1)
+        if [ -n "$vline" ]; then
+          vip=${vline%/*}; vp=${vline#*/}
+          vcidr=$(network_cidr "$vip" "$vp")
+          vgw=$(ip route 2>/dev/null | awk -v d="eth0.$vid" '/default/ && $0 ~ ("dev "d){print $3; exit}')
+          [ -z "$vgw" ] && vgw=$(echo "$vcidr" | sed 's,0/.*,1,')
+          gwping="no"
+          have ping && ping -c 1 -w 2 "$vgw" >/dev/null 2>&1 && gwping="yes"
+          echo " VLAN $vid : REACHABLE  lease $vip/$vp  net $vcidr  gw $vgw  gw-ping $gwping" >> "$RUN/vlan_reach.txt"
+          REACHED="$REACHED $vid"
+        else
+          echo " VLAN $vid : tagged OK, no DHCP lease (L2 permitted, no L3/DHCP answer)" >> "$RUN/vlan_reach.txt"
+        fi
+        ip link set "eth0.$vid" down 2>/dev/null
+        ip link del "eth0.$vid" 2>/dev/null
+      done
+      REACH_VLANS=$(echo "$REACHED" | sed 's/^ *//'); [ -z "$REACH_VLANS" ] && REACH_VLANS="-"
+      if [ "$REACH_VLANS" != "-" ]; then
+        record_check "INFO" "VLAN reachability" "reachable from this jack: $REACH_VLANS"
+      else
+        record_check "INFO" "VLAN reachability" "no probed VLANs reachable"
+      fi
+    fi
+    # Best-effort: put eth0's default route back if the probe stole it.
+    [ -n "$ORIG_DEFAULT" ] && ! ip route show default 2>/dev/null | grep -q . \
+      && ip route add $ORIG_DEFAULT 2>/dev/null
+    STOP_SPINNER
+  else
+    record_check "INFO" "VLAN reachability" "ip/udhcpc missing; reach probe skipped"
+  fi
+fi
+
+# ------------------------------- SCORE --------------------------------------
+MIS=$(awk -F'\t' '$1=="MISMATCH"{c++} END{print c+0}' "$RUN/checks.tsv")
+WARN=$(awk -F'\t' '$1=="WARN"{c++} END{print c+0}' "$RUN/checks.tsv")
+FAIL=$(awk -F'\t' '$1=="FAIL"{c++} END{print c+0}' "$RUN/checks.tsv")
+
+RESULT="PASS"
+REASON="Link, DHCP, and internet checks passed."
+
+if [ "$FAIL" -gt 0 ]; then
+  RESULT="FAIL"
+  REASON="Physical link failed."
+elif [ "$MIS" -gt 0 ]; then
+  RESULT="MISPATCH SUSPECTED"
+  REASON="One or more observed values do not match expected survey values."
+elif [ "$DHCP_RESULT" != "SUCCESS" ]; then
+  RESULT="LIMITED"
+  REASON="Physical link is up, but DHCP failed."
+elif ! { [ "$HTTPS_RESULT" = "PASS" ] || [ "$HTTP_RESULT" = "PASS" ]; }; then
+  RESULT="LIMITED"
+  REASON="Link and DHCP work, but internet reachability is limited or blocked."
+elif [ "$WARN" -gt 0 ]; then
+  RESULT="PASS WITH NOTES"
+  REASON="Core jack checks passed, but warnings were recorded."
+fi
+
+VLAN_DISPLAY="$OBS_VLAN"
+VLAN_CONF="Unknown"
+if [ -n "$OBS_VLAN" ] && [ "$OBS_VLAN" != "-" ]; then
+  VLAN_CONF="High - advertised by LLDP/CDP"
+else
+  VLAN_DISPLAY="not visible on access port"
+  VLAN_CONF="Low - access ports strip 802.1Q tags; use CIDR as a subnet hint"
+fi
+
+# ------------------------------ REPORT --------------------------------------
+LED CLEANUP
+SCREEN_WRITE "Writing report"
+
+{
+  echo "=========================================================="
+  echo " SHARK JACK DISPLAY - JACK SURVEY / DROP VALIDATOR"
+  echo "=========================================================="
+  echo " Run time : $(date -u '+%Y-%m-%d %H:%M:%SZ' 2>/dev/null)"
+  echo " Loot     : $RUN"
+  echo ""
+  echo "---- RESULT ----------------------------------------------"
+  echo " Status   : $RESULT"
+  echo " Reason   : $REASON"
+  echo ""
+  echo "---- CHECK SUMMARY ---------------------------------------"
+  awk -F'\t' '{printf " [%s] %-24s %s\n", $1, $2, $3}' "$RUN/checks.tsv"
+  echo ""
+  echo "---- EXPECTED VALUES -------------------------------------"
+  echo " Switch       : ${EXPECTED_SWITCH:-not set}"
+  echo " Port         : ${EXPECTED_PORT:-not set}"
+  echo " VLAN         : ${EXPECTED_VLAN:-not set}"
+  echo " CIDR         : ${EXPECTED_CIDR:-not set}"
+  echo " Min speed    : ${EXPECTED_SPEED_MIN:-not set}"
+  echo " Duplex       : ${EXPECTED_DUPLEX:-not set}"
+  echo ""
+  echo "---- PHYSICAL LINK ---------------------------------------"
+  echo " Link         : $LINK"
+  echo " Speed        : ${SPEED:-unknown} Mbps"
+  echo " Duplex       : ${DUPLEX:-unknown}"
+  echo ""
+  echo "---- DHCP ------------------------------------------------"
+  echo " Result       : $DHCP_RESULT"
+  echo " Time         : ${DHCP_SECS:-unknown}s"
+  echo " IP           : ${IP:--}/${PREFIX:--}"
+  echo " CIDR         : ${CIDR:--}"
+  echo " Gateway      : ${GATEWAY:--}"
+  echo " DNS          : ${DNS:--}"
+  echo " Domain       : ${DOMAIN:--}"
+  echo " DHCP server  : ${DHCP_SERVER:--}"
+  echo " Lease time   : ${LEASE:--}"
+  echo " NTP          : ${NTP:--}"
+  echo " PXE / TFTP   : ${TFTP:--}"
+  echo " WPAD / proxy : ${WPAD:--}"
+  echo ""
+  echo "---- SWITCH / PORT ---------------------------------------"
+  echo " LLDP switch  : ${L_NAME:--}"
+  echo " LLDP port    : ${L_PORT:--}"
+  echo " LLDP desc    : ${L_DESC:--}"
+  echo " LLDP mgmt    : ${L_MGMT:--}"
+  echo " LLDP VLAN    : ${L_VLAN:--}"
+  echo ""
+  echo " CDP device   : ${C_DEV:--}"
+  echo " CDP platform : ${C_PLAT:--}"
+  echo " CDP port     : ${C_PORT:--}"
+  echo " CDP mgmt     : ${C_ADDR:--}"
+  echo " CDP VLAN     : ${C_NVLAN:--}"
+  echo ""
+  echo "---- VLAN ------------------------------------------------"
+  echo " VLAN         : $VLAN_DISPLAY"
+  echo " Confidence   : $VLAN_CONF"
+  echo " CIDR hint    : ${CIDR:--}"
+  echo " Note         : On a normal access port, the switch strips VLAN tags."
+  echo ""
+  echo "---- PORT MODE / VLAN VISIBILITY -------------------------"
+  echo " Port mode         : $PORT_MODE"
+  echo " Tagged VLANs seen : $VLANS_SEEN"
+  if [ -s "$RUN/vlan_reach.txt" ]; then
+    echo " Reach probe (tag on, DHCP + gw ping, no scan):"
+    sed 's/^/ /' "$RUN/vlan_reach.txt"
+  else
+    echo " Reachability      : not probed (set PROBE_VLAN_REACH=1)"
+  fi
+  echo " Note         : tagged VLANs on a jack documented as access usually mean"
+  echo "                a trunk, a voice VLAN, or a port-based routing rule."
+  echo "                Reachable VLANs show what this port is actually"
+  echo "                permitted onto, end to end."
+  echo ""
+  echo "---- PASSIVE OBSERVATIONS --------------------------------"
+  echo " ARP hosts seen      : $ARPN"
+  echo " DHCP servers seen   : ${DHCP_SRV_SEEN:--}"
+  echo " Spanning-tree       : $STP_SEEN"
+  echo ""
+  echo "---- INTERNET --------------------------------------------"
+  echo " Test host    : $INTERNET_TEST_HOST"
+  echo " DNS lookup   : $DNS_RESULT"
+  echo " HTTPS        : $HTTPS_RESULT"
+  echo " HTTP         : $HTTP_RESULT"
+  echo ""
+  echo "---- RAW ARTIFACTS ---------------------------------------"
+  echo " passive.pcap"
+  echo " lldp.txt / cdp.txt"
+  echo " arp_hosts.tsv"
+  echo " dhcp.txt"
+  echo " vlan_reach.txt"
+  echo " dns_test.txt / https_test.txt / http_test.txt"
+  echo " checks.tsv"
+  echo "=========================================================="
+} > "$REPORT"
+
+# ------------------------------- DISPLAY ------------------------------------
+CLEAR_SCREEN 2>/dev/null
+
+case "$RESULT" in
+  PASS|PASS\ WITH\ NOTES) LED FINISH ;;
+  LIMITED|MISPATCH\ SUSPECTED) LED SPECIAL ;;
+  *) LED FAIL ;;
+esac
+
+SCREEN_WRITE "Jack: $RESULT"
+SCREEN_WRITE "Link: ${SPEED:-?} ${DUPLEX:-?}"
+
+if [ -n "$IP" ]; then
+  SCREEN_WRITE "IP: $IP/$PREFIX"
+else
+  SCREEN_WRITE "DHCP: FAILED"
+fi
+
+[ -n "$SWITCH" ] && [ "$SWITCH" != "-" ] && SCREEN_WRITE "Sw: $SWITCH"
+[ -n "$PORT" ] && [ "$PORT" != "-" ] && SCREEN_WRITE "Port: $PORT"
+SCREEN_WRITE "VLAN: $VLAN_DISPLAY"
+[ "$VLANS_SEEN" != "-" ] && SCREEN_WRITE "Trunk VLANs: $VLANS_SEEN"
+[ "$REACH_VLANS" != "-" ] && SCREEN_WRITE "Reach: $REACH_VLANS"
+SCREEN_WRITE "Net: DNS $DNS_RESULT HTTPS $HTTPS_RESULT"
+
+ALERT "Jack Survey $RESULT: ${IP:-no DHCP}, ${SPEED:-?}Mbps ${DUPLEX:-?}" 12 2>/dev/null
+exit 0
