@@ -1,0 +1,1998 @@
+#!/bin/bash
+# Title: SharkTAKDisplay
+# Description: Wired network survey to TAK - fingerprint, host/service discovery, baseline (rogue device) diff and packet capture, sent as a CoT marker with the summary in remarks plus a data package with the full results
+# Author: SECT0101
+# Version: 1.0.1
+# Category: Recon
+# Target: Any wired Ethernet network you are authorized to assess
+#
+# What it does
+#   Network fingerprint   IP / gateway / DNS, DHCP servers (flags a rogue DHCP server),
+#                         LLDP / CDP switch, port and VLAN, link speed, internet check, public IP
+#   Host + services       nmap ARP/ping sweep, then top ports with service versions
+#                         (optional light "safe" NSE scripts)
+#   Baseline diff         Save a known-good scan per network, flag new / missing devices
+#                         and new open ports on the next survey
+#   Packet capture        tcpdump for N seconds, the pcap goes in the data package
+#
+# Results go to TAK as
+#   - One CoT marker at the jack's position, with the survey summary in the remarks
+#   - A data package (summary, host list, nmap output, diff, pcap) attached to that marker,
+#     sent to one TAK contact, to everyone, or only uploaded to the TAK Server
+#   - Optional per-host markers in a small ring around the jack (not real positions)
+#   Nothing reachable? Results are queued and sent the next time the jack is online.
+#
+# Location (the jack has no GPS or Wi-Fi radio), most accurate first:
+#   1. LLDP-MED coordinates from the switch, if the network publishes them
+#   2. Anchor to your own ATAK: your phone's last position from the TAK Server
+#   3. A saved site, or a manual lat/lon
+#   4. Coordinates written in the switch's LLDP / SNMP location text
+#   5. Public IP geolocation (city level - marked with a large CE so TAK shows it is rough)
+#
+# Setup (first run stages the folders and a default.cfg - then Settings > Setup Check)
+#   - Settings > Install Packages (needs internet): openssl-util, libopenssl-legacy, unzip,
+#     tcpdump, snmp-utils (+ optional nmap-full). Data-package zips are built in (no zip package). nmap, curl and lldpd are on the Shark Jack Display already.
+#   - Copy your ATAK connection package (.zip) to /root/sharktakdisplay/certs - server, port and
+#     certificates are imported from it. Or client.pem + ca.pem, .p12 files, or Enroll on the device.
+#   - A network path to your TAK Server from the network you plug into. If there is none,
+#     everything is queued - plug into a network that has one and use TAK > Send queue.
+#
+# LED (Hak5 common states)
+#   SETUP    Getting on the network / configuring
+#   ATTACK   Scanning
+#   STAGE2   Talking to the TAK Server
+#   SPECIAL  Baseline changes or a second DHCP server found
+#   FINISH   Survey sent
+#   FAIL     Error
+#   CLEANUP  Queued for later
+#   (on exit the LED goes back to what it was before the payload started)
+#
+# Files
+#   default.cfg (payload folder)      settings, format "KEY: value" (edit over SSH or on the device)
+#   /root/sharktakdisplay/certs/      TAK certificates or connection package (never share them)
+#   /root/sharktakdisplay/queue/      results waiting to be sent
+#   /root/sharktakdisplay/baselines/  known-good scans, one per network
+#   /root/sharktakdisplay/sites.txt   saved sites: name|lat|lon
+#   /root/loot/sharktakdisplay/       every survey (summary, hosts, nmap, pcap, package)
+#   /root/sharktakdisplay/logs/       logs, history and the last running step (survive a shutdown)
+#
+# Use only on networks you own or are authorized to assess.
+
+# ---------------------------------------------------------------------------
+# Options - defaults only. default.cfg in this folder (written on first run, changed on the
+# device or over SSH) wins over these. Use placeholders here, never live servers.
+# ---------------------------------------------------------------------------
+# Bash 5.2+: "&" in ${var//x/y} would mean "the match" and break the XML escaping below
+shopt -u patsub_replacement 2>/dev/null
+
+PAYLOAD_VERSION="1.0.1"
+PRODUCT_NAME="SharkTAKDisplay"
+PROFILE="default.cfg"
+
+D_TAK_HOST="takserver.example.com"  # TAK Server host name or IP
+D_TAK_PROTO="tls"                    # tls (8089, client cert) | tcp (8087/8088, no auth) | udp (send only)
+D_TAK_PORT="8089"
+D_API_PORT="8443"                    # Marti API for data packages: 8443 with a cert, 8080 without
+D_ENROLL_PORT="8446"
+D_CALLSIGN="SHARK-1"
+D_TEAM="Cyan"
+D_ROLE="Team Member"
+D_MY_ATAK=""                         # your ATAK callsign, for "Anchor to my ATAK"
+D_ANCHOR_MAX_AGE="1800"              # seconds: ignore an ATAK position older than this
+D_LOC_MODE="auto"                    # auto | atak | site | manual | ip
+D_SITE=""                            # name of the default saved site
+D_MANUAL_LAT=""
+D_MANUAL_LON=""
+D_IPGEO="1"                          # 1 = allow a public IP geolocation lookup
+D_IPGEO_URL="https://ipinfo.io/json"
+D_SURVEY_NETMODE="DHCP_CLIENT"       # DHCP_CLIENT | STATIC (uses the Shark Jack's config.txt values)
+D_SCAN_SCOPE="24"                    # largest subnet swept: 24 = local /24 only, 22, 20, or "full"
+D_TOP_PORTS="100"                    # nmap --top-ports for the service scan
+D_SERVICE_VERSIONS="1"               # 1 = nmap -sV --version-light
+D_NSE="0"                            # 1 = light safe scripts (http-title, ssl-cert, smb-os-discovery...)
+D_HOST_TIMEOUT="90s"
+D_LLDP_WAIT="35"                     # seconds to listen for LLDP/CDP (switches send every 30-60 s)
+D_SNMP="1"                           # 1 = ask the gateway / switch for sysLocation (if snmpget is installed)
+D_SNMP_COMMUNITY="public"
+D_PCAP_SECONDS="30"
+D_PCAP_MAX_PACKETS="20000"
+D_SURVEY_PCAP="0"                    # 1 = Full survey includes the packet capture
+D_HOST_MARKERS="0"                   # 1 = also send one marker per host (in a ring around the jack)
+D_HOST_RING_M="25"
+D_MAX_HOST_MARKERS="40"
+D_STALE_HOURS="24"                   # how long the survey marker stays on the map
+D_LISTEN="8"                         # seconds to listen for TAK contacts after connecting
+D_CHAT_ALERT="1"
+D_SCAN_BATCH="4"                     # hosts per service-scan batch; each batch is saved when it finishes
+D_BATCH_LIMIT="240"                  # seconds before a stuck batch is stopped and the scan moves on
+D_MIN_FREE_KB="30000"                # version detection (-sV) needs ~20 MB; only run it with this much free
+D_WATCHDOG_KB="3000"                 # stop nmap if free memory falls below this (keeps the jack from freezing)
+D_SCAN_RATE="50"                     # nmap --max-rate (packets per second) - the jack's Ethernet locks up under floods
+D_SCAN_TYPE="connect"                # connect (-sT, gentle) | syn (-sS, raw packets, faster)
+D_BIG_SCAN_HOSTS="24"                # on battery, ask before a service scan of more live hosts than this                     # 1 = GeoChat line to All Chat Rooms when new devices are found
+
+# Paths
+BASE_DIR="/root/sharktakdisplay"
+CERT_DIR="$BASE_DIR/certs"
+QUEUE_DIR="$BASE_DIR/queue"
+SENT_DIR="$BASE_DIR/sent"
+BASELINE_DIR="$BASE_DIR/baselines"
+SITES_FILE="$BASE_DIR/sites.txt"
+CONTACTS_FILE="$BASE_DIR/contacts.txt"     # callsign|uid|lat|lon|ce|epoch
+LOOT_BASE="/root/loot/sharktakdisplay"
+RUN="/tmp/sharktakdisplay"
+LOGS="$BASE_DIR/logs"                      # kept on flash: they survive a shutdown or a flat battery
+CLIENT_PEM="client.pem"
+CA_PEM="ca.pem"
+BACK="← Back"
+
+# Regexes live in variables so Bash's [[ =~ ]] reads them as plain ERE
+RE_EV_UID='<event[^>]*[[:space:]]uid="([^"]*)"'
+RE_EV_TIME='<event[^>]*[[:space:]]time="([^"]*)"'
+RE_CS='<contact[^>]*[[:space:]]callsign="([^"]*)"'
+RE_PT_LAT='<point[^>]*[[:space:]]lat="([^"]*)"'
+RE_PT_LON='<point[^>]*[[:space:]]lon="([^"]*)"'
+RE_PT_CE='<point[^>]*[[:space:]]ce="([^"]*)"'
+RE_LATLON_TEXT='(-?[0-9]{1,2}\.[0-9]{3,})[[:space:]]*[,;/[:space:]][[:space:]]*(-?[0-9]{1,3}\.[0-9]{3,})'
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# Settings: the defaults above, overridden by the payload's default.cfg (edit it over SSH, or on the device)
+# Hak5's SET_PAYLOAD_CONFIG_OPTION appends a new line on every save, so a value saved twice
+# shows up twice. SharkTAKDisplay reads and writes its own default.cfg instead: one
+# "KEY: value" line per setting, changed in place. Hak5's commands are only a fallback.
+CFG_FILE=""
+find_cfg_file() {
+    local d f
+    for d in "$(dirname "$0" 2>/dev/null)" "$PWD"; do
+        if [ -f "$d/payload.txt" ] && grep -q '^# Title: SharkTAKDisplay' "$d/payload.txt" 2>/dev/null; then
+            CFG_FILE="$(cd "$d" && pwd)/$PROFILE"; return 0
+        fi
+    done
+    while IFS= read -r f; do
+        if grep -q '^# Title: SharkTAKDisplay' "$f" 2>/dev/null; then CFG_FILE="${f%/*}/$PROFILE"; return 0; fi
+    done < <(find /root/library /root/payloads -maxdepth 6 -type f -name payload.txt -path '*SharkTAKDisplay*' 2>/dev/null)
+    CFG_FILE=""; return 1
+}
+cfg() {
+    local v
+    if [ -n "$CFG_FILE" ]; then
+        v=$(awk -v k="$1: " 'index($0, k) == 1 { v = substr($0, length(k) + 1) } END { print v }' "$CFG_FILE" 2>/dev/null)
+    else
+        v=$(GET_PAYLOAD_CONFIG_OPTION "$1" "$2" "$PROFILE" 2>/dev/null)
+    fi
+    printf '%s' "${v:-$2}"
+}
+cfg_set() {
+    if [ -n "$CFG_FILE" ]; then
+        touch "$CFG_FILE"
+        awk -v k="$1: " -v line="$1: $2" '
+            index($0, k) == 1 { if (!done) { print line; done = 1 }; next }
+            { print }
+            END { if (!done) print line }' "$CFG_FILE" > "$CFG_FILE.tmp" && mv "$CFG_FILE.tmp" "$CFG_FILE"
+    else
+        SET_PAYLOAD_CONFIG_OPTION "$1" "$2" "$PROFILE" >/dev/null 2>&1
+    fi
+}
+# One line per key. Where a key appears more than once (from Hak5's appending saves, or
+# the template bug before this build), keep the last value that isn't the built-in default,
+# so your own edits win over repeated default blocks.
+repair_cfg() {
+    [ -n "$CFG_FILE" ] && [ -f "$CFG_FILE" ] || return 0
+    local v
+    for v in ${!D_@}; do printf '%s\t%s\n' "${v#D_}" "${!v}"; done > "$RUN/cfg.defaults"
+    awk -F'\t' '
+        NR == FNR { def[$1] = $2; next }
+        /^[A-Za-z_][A-Za-z0-9_]*: / {
+            k = substr($0, 1, index($0, ":") - 1); val = substr($0, length(k) + 3)
+            if (!(k in seen)) { seen[k] = 1; order[++n] = k; keep[k] = val }
+            else if (!((k in def) && val == def[k])) keep[k] = val
+            else if (keep[k] == "" ) keep[k] = val
+            next
+        }
+        { other[++m] = $0 }
+        END { for (i = 1; i <= n; i++) print order[i] ": " keep[order[i]]
+              for (i = 1; i <= m; i++) if (other[i] != "") print other[i] }' "$RUN/cfg.defaults" "$CFG_FILE" > "$CFG_FILE.tmp"
+    if ! cmp -s "$CFG_FILE" "$CFG_FILE.tmp"; then cp "$CFG_FILE" "$CFG_FILE.bak"; mv "$CFG_FILE.tmp" "$CFG_FILE"; CFG_REPAIRED=1
+    else rm -f "$CFG_FILE.tmp"; fi
+}
+
+load_config() {
+    C_HOST=$(cfg TAK_HOST "$D_TAK_HOST");        C_PROTO=$(cfg TAK_PROTO "$D_TAK_PROTO")
+    C_PORT=$(cfg TAK_PORT "$D_TAK_PORT");        C_API_PORT=$(cfg API_PORT "$D_API_PORT")
+    C_ENROLL_PORT=$(cfg ENROLL_PORT "$D_ENROLL_PORT")
+    C_CALLSIGN=$(cfg CALLSIGN "$D_CALLSIGN");    C_TEAM=$(cfg TEAM "$D_TEAM");  C_ROLE=$(cfg ROLE "$D_ROLE")
+    C_MY_ATAK=$(cfg MY_ATAK "$D_MY_ATAK");       C_ANCHOR_AGE=$(cfg ANCHOR_MAX_AGE "$D_ANCHOR_MAX_AGE")
+    C_LOC_MODE=$(cfg LOC_MODE "$D_LOC_MODE");    C_SITE=$(cfg SITE "$D_SITE")
+    C_MAN_LAT=$(cfg MANUAL_LAT "$D_MANUAL_LAT"); C_MAN_LON=$(cfg MANUAL_LON "$D_MANUAL_LON")
+    C_IPGEO=$(cfg IPGEO "$D_IPGEO");             C_IPGEO_URL=$(cfg IPGEO_URL "$D_IPGEO_URL")
+    C_NETMODE=$(cfg SURVEY_NETMODE "$D_SURVEY_NETMODE")
+    C_SCOPE=$(cfg SCAN_SCOPE "$D_SCAN_SCOPE");   C_TOP=$(cfg TOP_PORTS "$D_TOP_PORTS")
+    C_SV=$(cfg SERVICE_VERSIONS "$D_SERVICE_VERSIONS"); C_NSE=$(cfg NSE "$D_NSE")
+    C_HTO=$(cfg HOST_TIMEOUT "$D_HOST_TIMEOUT"); C_LLDP_WAIT=$(cfg LLDP_WAIT "$D_LLDP_WAIT")
+    C_SNMP=$(cfg SNMP "$D_SNMP");                C_COMMUNITY=$(cfg SNMP_COMMUNITY "$D_SNMP_COMMUNITY")
+    C_PCAP_S=$(cfg PCAP_SECONDS "$D_PCAP_SECONDS"); C_PCAP_N=$(cfg PCAP_MAX_PACKETS "$D_PCAP_MAX_PACKETS")
+    C_SURVEY_PCAP=$(cfg SURVEY_PCAP "$D_SURVEY_PCAP")
+    C_HOST_MARKERS=$(cfg HOST_MARKERS "$D_HOST_MARKERS"); C_RING=$(cfg HOST_RING_M "$D_HOST_RING_M")
+    C_MAX_HM=$(cfg MAX_HOST_MARKERS "$D_MAX_HOST_MARKERS")
+    C_STALE_H=$(cfg STALE_HOURS "$D_STALE_HOURS"); C_LISTEN=$(cfg LISTEN "$D_LISTEN")
+    C_CHAT_ALERT=$(cfg CHAT_ALERT "$D_CHAT_ALERT")
+    C_BATCH=$(num "$(cfg SCAN_BATCH "$D_SCAN_BATCH")"); [ "${C_BATCH:-0}" -gt 0 ] || C_BATCH=4
+    C_BATCH_LIMIT=$(num "$(cfg BATCH_LIMIT "$D_BATCH_LIMIT")"); C_BATCH_LIMIT=${C_BATCH_LIMIT:-240}
+    C_MIN_FREE=$(num "$(cfg MIN_FREE_KB "$D_MIN_FREE_KB")"); C_MIN_FREE=${C_MIN_FREE:-30000}
+    C_WATCHDOG=$(num "$(cfg WATCHDOG_KB "$D_WATCHDOG_KB")"); C_WATCHDOG=${C_WATCHDOG:-3000}
+    C_RATE=$(num "$(cfg SCAN_RATE "$D_SCAN_RATE")"); C_RATE=${C_RATE:-50}
+    C_STYPE=$(cfg SCAN_TYPE "$D_SCAN_TYPE")
+    C_BIG=$(num "$(cfg BIG_SCAN_HOSTS "$D_BIG_SCAN_HOSTS")"); C_BIG=${C_BIG:-24}
+}
+
+num() { [[ $1 =~ ^[0-9]+$ ]] && printf '%d' "$((10#$1))"; }   # "030" -> 30 (never octal)
+cancelled() { [ -z "$1" ] || [ "$1" = "$BACK" ] || [ "$1" = "Cancelled" ]; }
+info() { ALERT "$1" -1 false true; }           # message screen, waits for a button
+note() { ALERT "$1" 2 false; }                 # short message, 2 s
+onoff() { [ "$1" = 1 ] && echo On || echo Off; }
+
+xml_esc() {
+    local s=$1
+    s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; s=${s//\"/&quot;}; s=${s//\'/&apos;}
+    s=${s//$'\n'/&#10;}
+    printf '%s' "$s"
+}
+xml_unesc() { local s=$1; s=${s//&lt;/<}; s=${s//&gt;/>}; s=${s//&quot;/\"}; s=${s//&apos;/\'}; s=${s//&amp;/&}; printf '%s' "$s"; }
+iso_time() { date -u -d "@$1" '+%Y-%m-%dT%H:%M:%S.000Z'; }
+new_id() { cat /proc/sys/kernel/random/uuid; }
+valid_coord() {  # valid_coord lat lon
+    [[ $1 =~ ^-?[0-9]{1,2}(\.[0-9]+)?$ ]] && [[ $2 =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] || return 1
+    awk -v a="$1" -v o="$2" 'BEGIN { exit !(a >= -90 && a <= 90 && o >= -180 && o <= 180 && !(a == 0 && o == 0)) }'
+}
+iso_epoch() {  # iso_epoch 2026-01-02T03:04:05.000Z -> epoch on stdout
+    local t=${1%%.*}; t=${t%Z}; t=${t/T/ }
+    date -u -d "$t" +%s 2>/dev/null
+}
+
+# run_for SECONDS cmd... - like timeout, works without coreutils timeout
+run_for() {
+    local s=$1; shift
+    if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+    "$@" & local pid=$!
+    ( sleep "$s"; kill "$pid" 2>/dev/null ) & local w=$!
+    wait "$pid" 2>/dev/null; local rc=$?
+    kill "$w" 2>/dev/null
+    return $rc
+}
+
+# need_pkg command package "why" - offers to install a missing package (needs internet)
+need_pkg() {
+    command -v "$1" >/dev/null 2>&1 && return 0
+    local r
+    r=$(CONFIRMATION_DIALOG "$3 needs $2. Install now? (internet)" "Install")
+    [ "$r" = "Install" ] || return 1
+    ensure_net || return 1
+    CREATE_SPINNER "Installing $2"
+    opkg update > "$LOGS/opkg.log" 2>&1     # always ends in an error for the firmware's missing hak5 feed - ignored
+    opkg install "$2" >> "$LOGS/opkg.log" 2>&1
+    STOP_SPINNER
+    command -v "$1" >/dev/null 2>&1 && { LOG "$2 installed"; return 0; }
+    info "Install of $2 failed.\nSee $LOGS/opkg.log"
+    return 1
+}
+
+need_pkg_quiet() {  # need_pkg_quiet package - installs without asking (used during setup steps the user started)
+    ensure_net || return 1
+    CREATE_SPINNER "Installing $1"
+    opkg update > "$LOGS/opkg.log" 2>&1
+    opkg install "$1" >> "$LOGS/opkg.log" 2>&1; local rc=$?
+    STOP_SPINNER
+    return $rc
+}
+
+# Breadcrumb on flash: which step was running. If the jack loses power mid-scan, the next
+# start says where it stopped (and the history log keeps it).
+step() {
+    mkdir -p "$LOGS" 2>/dev/null
+    printf '%s|%s\n' "$(date '+%F %T')" "$1" > "$LOGS/step"
+    printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOGS/history.log"
+    sync
+}
+step_check() {  # at start: report an unfinished previous run
+    [ -s "$LOGS/step" ] || return 0
+    local last; last=$(cut -d'|' -f2- "$LOGS/step")
+    case "$last" in exit|idle|menu) return 0 ;; esac
+    LAST_STOP="$last"
+    printf '%s %s\n' "$(date '+%F %T')" "start after unclean stop during: $last" >> "$LOGS/history.log"
+}
+trim_logs() {  # keep each log under ~200 KB
+    local f
+    for f in "$LOGS"/*.log; do
+        [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 204800 ] && { tail -c 102400 "$f" > "$f.t" && mv "$f.t" "$f"; }
+    done
+}
+
+device_uid() {
+    mkdir -p "$BASE_DIR"
+    [ -s "$BASE_DIR/uid" ] || new_id | cut -c1-8 > "$BASE_DIR/uid"
+    echo "SharkTAKDisplay-$(cat "$BASE_DIR/uid")"
+}
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+NET_READY=0
+ensure_net() {
+    [ "$NET_READY" = 1 ] && ip -4 addr show eth0 2>/dev/null | grep -q 'inet ' && return 0
+    LED SETUP
+    CREATE_SPINNER "Waiting for link"
+    WAIT_FOR_LINK
+    STOP_SPINNER
+    local mode
+    mode=$(GET_NETMODE 2>/dev/null)
+    if [ "$mode" != "$C_NETMODE" ] || ! ip -4 addr show eth0 | grep -q 'inet '; then
+        CREATE_SPINNER "NETMODE $C_NETMODE"
+        NETMODE "$C_NETMODE"
+        WAIT_FOR_IP
+        STOP_SPINNER
+    fi
+    if ! ip -4 addr show eth0 | grep -q 'inet '; then
+        LED FAIL; info "No IP address on eth0.\nDHCP / static settings?"
+        return 1
+    fi
+    NET_READY=1
+    # TLS and public-IP lookups need the right time. Quietly try once.
+    if [ "${TIME_SYNCED:-0}" = 0 ]; then
+        run_for 20 SYNC_TIME >/dev/null 2>&1 && TIME_SYNCED=1
+    fi
+    return 0
+}
+
+net_basics() {  # sets N_IP N_CIDR N_PREFIX N_GW N_DNS N_MAC
+    N_IP=$(ip -o -4 addr show eth0 | awk '{print $4}' | head -1)
+    N_PREFIX=${N_IP#*/}; N_IP=${N_IP%/*}
+    N_CIDR=$(ip -4 route show dev eth0 | awk '/scope link/ {print $1; exit}')
+    N_GW=$(ip -4 route | awk '/^default/ {print $3; exit}')
+    N_DNS=$(awk '/^nameserver/ {printf "%s%s", s, $2; s=","}' /etc/resolv.conf 2>/dev/null)
+    N_MAC=$(cat /sys/class/net/eth0/address 2>/dev/null)
+}
+
+# Scan target: never wider than SCAN_SCOPE, so a /16 does not eat the battery
+scan_target() {
+    net_basics
+    [ -n "$N_CIDR" ] || return 1
+    local want=$C_SCOPE
+    if [ "$want" = "full" ] || [ "$N_PREFIX" -ge "$want" ]; then echo "$N_CIDR"; return 0; fi
+    # clamp to the /want around our own address
+    awk -v ip="$N_IP" -v p="$want" 'BEGIN {
+        split(ip, o, "."); n = ((o[1]*256 + o[2])*256 + o[3])*256 + o[4]
+        size = 2 ^ (32 - p); n = int(n / size) * size
+        printf "%d.%d.%d.%d/%d\n", int(n/16777216)%256, int(n/65536)%256, int(n/256)%256, n%256, p }'
+}
+
+# Some Bash builds have no /dev/tcp; then nc / nmap stand in
+have_devtcp() {
+    [ -n "$DEVTCP" ] || { bash -c 'exec 9<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file' && DEVTCP=0 || DEVTCP=1; }
+    [ "$DEVTCP" = 1 ]
+}
+tcp_probe() {  # tcp_probe host port -> 0 if it answers within 6 s
+    if have_devtcp; then run_for 6 bash -c "exec 9<>/dev/tcp/$1/$2" >/dev/null 2>&1; return $?; fi
+    nmap -Pn -p "$2" --max-retries 1 --host-timeout 8s "$1" 2>/dev/null | grep -q "^$2/tcp *open"
+}
+
+# ---------------------------------------------------------------------------
+# Survey bookkeeping
+# ---------------------------------------------------------------------------
+new_survey() {
+    S_TS=$(date +%Y%m%d-%H%M%S)
+    S_ID=$(new_id)
+    S_DIR="$LOOT_BASE/$S_TS"
+    mkdir -p "$S_DIR"
+    : > "$S_DIR/summary.txt"
+    S_PARTS=""
+    S_REMARKS=()
+    S_ALERT=0
+}
+ensure_survey() { [ -n "$S_DIR" ] && [ -d "$S_DIR" ] || new_survey; }
+sum() { printf '%s\n' "$1" >> "$S_DIR/summary.txt"; LOG "$1"; }
+remark() { S_REMARKS+=("$1"); }
+
+# ---------------------------------------------------------------------------
+# Scan: network fingerprint
+# ---------------------------------------------------------------------------
+# nmap with its script engine (nmap-full)? The OpenWrt "nmap" package has none.
+nmap_nse() {
+    [ -n "$NSE_OK" ] || { nmap --script-help banner >/dev/null 2>&1 && NSE_OK=1 || NSE_OK=0; }
+    [ "$NSE_OK" = 1 ]
+}
+
+# DHCP servers on the wire -> space-separated list (also written to dhcp.txt)
+#   nmap-full: broadcast-dhcp-discover. Otherwise a DHCP request of our own (udhcpc with a
+#   do-nothing script, so eth0 is not touched), with tcpdump catching every server's offer.
+dhcp_servers() {
+    local f="$S_DIR/dhcp.txt" tp=""
+    if nmap_nse; then
+        nmap --script broadcast-dhcp-discover --script-args broadcast-dhcp-discover.timeout=6 -e eth0 > "$f" 2>&1
+        grep -i 'Server Identifier' "$f" | awk '{print $NF}' | sort -u | tr '\n' ' '
+        return
+    fi
+    : > "$f"
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpdump -i eth0 -n -l -v 'udp and (port 67 or port 68)' > "$RUN/dhcp.cap" 2>/dev/null &
+        tp=$!
+        sleep 1
+    fi
+    run_for 14 udhcpc -i eth0 -f -q -n -t 3 -T 3 -s /bin/true >> "$f" 2>&1
+    if [ -n "$tp" ]; then
+        sleep 2; kill "$tp" 2>/dev/null; wait "$tp" 2>/dev/null
+        { echo "--- tcpdump"; cat "$RUN/dhcp.cap"; } >> "$f"
+        # every offer/ack names its server in option 54 (Server-ID)
+        grep -oi 'Server-ID[^:]*: *[0-9.]*' "$RUN/dhcp.cap" | awk '{print $NF}' | sort -u | tr '\n' ' '
+        grep -qi 'Server-ID' "$RUN/dhcp.cap" && return
+    fi
+    sed -n 's/.*obtained from \([0-9.]*\).*/\1/p' "$f" | sort -u | tr '\n' ' '
+}
+
+# Free memory in KB (MemAvailable, or MemFree + Cached on older kernels)
+mem_free_kb() {
+    awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } /^Cached:/ { c = $2 }
+         END { print (a != "" ? a : f + c) + 0 }' /proc/meminfo 2>/dev/null
+}
+# Vitals on flash every 3 s (watchdog every 1 s) while scanning: if the jack locks up, the last lines show
+# whether memory ran out (free KB, nmap RSS) or it was something else (memory fine).
+vitals_start() {
+    vitals_stop
+    (
+        local n=0 f
+        while :; do
+            f=$(mem_free_kb)
+            # watchdog: the jack has no swap, so running out of memory freezes it - stop nmap first
+            if [ "${f:-0}" -lt "${C_WATCHDOG:-3000}" ] && pidof nmap >/dev/null 2>&1; then
+                echo "$(date '+%F %T') watchdog stopped nmap: ${f} KB free" >> "$LOGS/history.log"
+                echo "$(date '+%T') WATCHDOG killed nmap at free=${f}KB" >> "$LOGS/vitals.log"
+                sync
+                killall -9 nmap 2>/dev/null
+            fi
+            n=$((n + 1)); [ $((n % 3)) -eq 1 ] || { sleep 1; continue; }   # check every 1 s, log every 3 s
+            printf '%s free=%sKB load=%s nmap=%sKB\n' "$(date '+%T')" "$f" \
+                "$(cut -d' ' -f1 /proc/loadavg)" \
+                "$(for p in $(pidof nmap 2>/dev/null); do awk '/^VmRSS:/ {print $2}' "/proc/$p/status" 2>/dev/null; done | head -1)" \
+                >> "$LOGS/vitals.log"
+            sync
+            sleep 1
+        done
+    ) &
+    VITALS_PID=$!
+}
+vitals_stop() { [ -n "$VITALS_PID" ] && kill "$VITALS_PID" 2>/dev/null; VITALS_PID=""; }
+
+# nmap at the lowest CPU priority, so the screen, buttons and SSH stay responsive
+NMAP_LOW=(nmap); command -v nice >/dev/null 2>&1 && NMAP_LOW=(nice -n 19 nmap)
+nmap_low() { "${NMAP_LOW[@]}" "$@"; }
+
+LLDPD_STARTED=0
+lldp_listen() {  # fills $S_DIR/lldp.txt (key=value)
+    local i=0
+    if ! pgrep lldpd >/dev/null 2>&1; then
+        if command -v lldpd >/dev/null 2>&1; then
+            lldpd -c -r >/dev/null 2>&1 && LLDPD_STARTED=1      # CDP on, receive-only (does not announce the jack)
+        else
+            /etc/init.d/lldpd start >/dev/null 2>&1 && LLDPD_STARTED=1
+        fi
+    fi
+    command -v lldpctl >/dev/null 2>&1 || return 1
+    CREATE_SPINNER "LLDP/CDP ${C_LLDP_WAIT}s"
+    while [ "$i" -lt "$C_LLDP_WAIT" ]; do
+        if lldpctl -f keyvalue 2>/dev/null | grep -q '^lldp\.eth0\.chassis'; then
+            sleep 2; break
+        fi
+        sleep 1; i=$((i + 1))
+    done
+    STOP_SPINNER
+    lldpctl -f keyvalue 2>/dev/null | sed 's/^lldp\.eth0\.//' > "$S_DIR/lldp.txt"
+    [ -s "$S_DIR/lldp.txt" ]
+}
+lldp_get() { grep -m1 -i "^$1=" "$S_DIR/lldp.txt" 2>/dev/null | cut -d= -f2-; }
+
+# parse "36.1627 N" / "-86.78" / "86.78 W" -> signed decimal
+coord_num() {
+    awk -v s="$1" 'BEGIN { if (match(s, /-?[0-9]+(\.[0-9]+)?/)) { v = substr(s, RSTART, RLENGTH) + 0
+        if (s ~ /[SsWw]([^a-zA-Z]|$)/ && v > 0) v = -v; printf "%.6f\n", v } }'
+}
+# find "lat, lon" inside free text (SNMP / LLDP location strings)
+coords_in_text() {
+    [[ $1 =~ $RE_LATLON_TEXT ]] || return 1
+    local a=${BASH_REMATCH[1]} o=${BASH_REMATCH[2]}      # copy first: valid_coord runs its own =~
+    valid_coord "$a" "$o" || return 1
+    printf '%s %s\n' "$a" "$o"
+}
+
+scan_fingerprint() {
+    ensure_survey; ensure_net || return 1
+    LED ATTACK
+    net_basics
+    local speed duplex gwmac gwvendor conn dhcp servers n
+    speed=$(cat /sys/class/net/eth0/speed 2>/dev/null); duplex=$(cat /sys/class/net/eth0/duplex 2>/dev/null)
+    sum "== Network fingerprint $(date '+%F %T')"
+    sum "IP: $N_IP/$N_PREFIX  Net: $N_CIDR"
+    sum "Gateway: ${N_GW:-none}  DNS: ${N_DNS:-none}"
+    sum "Jack MAC: $N_MAC  Link: ${speed:-?}Mb ${duplex:-?}"
+    if [ -n "$N_GW" ]; then
+        ping -c 1 -W 1 "$N_GW" >/dev/null 2>&1
+        gwmac=$(ip neigh show "$N_GW" dev eth0 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="lladdr") print $(i+1)}')
+        F_GWMAC=$gwmac
+        [ -n "$gwmac" ] && sum "Gateway MAC: $gwmac"
+    fi
+
+    # DHCP servers: more than one answering is a rogue DHCP server
+    step "fingerprint: DHCP check"
+    CREATE_SPINNER "DHCP servers"
+    servers=$(dhcp_servers)
+    STOP_SPINNER
+    n=$(wc -w <<< "$servers")
+    F_DHCP="$n"
+    sum "DHCP servers ($n): ${servers:-none}"
+    if [ "$n" -gt 1 ]; then sum "!! More than one DHCP server - possible rogue DHCP"; S_ALERT=1; fi
+
+    # LLDP / CDP
+    F_SWITCH=""; F_PORT=""; F_VLAN=""; F_LOCTXT=""; F_MED_LAT=""; F_MED_LON=""; F_MGMT=""
+    if lldp_listen; then
+        F_SWITCH=$(lldp_get chassis.name); F_PORT=$(lldp_get port.ifname)
+        [ -z "$F_PORT" ] && F_PORT=$(lldp_get port.local)
+        F_VLAN=$(lldp_get vlan.vlan-id); [ -z "$F_VLAN" ] && F_VLAN=$(grep -m1 -i '^vlan' "$S_DIR/lldp.txt" | cut -d= -f2-)
+        F_MGMT=$(lldp_get chassis.mgmt-ip)
+        local pdesc via med_lat med_lon
+        pdesc=$(lldp_get port.descr); via=$(lldp_get via)
+        sum "Switch ($via): ${F_SWITCH:-?} port ${F_PORT:-?} ${pdesc:+($pdesc)} VLAN ${F_VLAN:-?}"
+        [ -n "$F_MGMT" ] && sum "Switch mgmt IP: $F_MGMT"
+        # LLDP-MED location (E911): coordinates or civic address
+        med_lat=$(grep -m1 -i 'latitude=' "$S_DIR/lldp.txt" | cut -d= -f2-)
+        med_lon=$(grep -m1 -i 'longitude=' "$S_DIR/lldp.txt" | cut -d= -f2-)
+        if [ -n "$med_lat" ] && [ -n "$med_lon" ]; then
+            med_lat=$(coord_num "$med_lat"); med_lon=$(coord_num "$med_lon")
+            if valid_coord "$med_lat" "$med_lon"; then
+                F_MED_LAT=$med_lat; F_MED_LON=$med_lon; sum "LLDP-MED coordinates: $med_lat, $med_lon"
+            fi
+        fi
+        F_LOCTXT=$(grep -i 'lldp-med.location' "$S_DIR/lldp.txt" | grep -vi 'itude=' | cut -d= -f2- | tr '\n' ' ' | sed 's/  */ /g')
+        [ -n "$F_LOCTXT" ] && sum "LLDP-MED location: $F_LOCTXT"
+        [ -z "$F_LOCTXT" ] && [ -n "$pdesc" ] && F_LOCTXT="port: $pdesc"
+    else
+        sum "No LLDP/CDP neighbor in ${C_LLDP_WAIT}s"
+    fi
+
+    # SNMP sysLocation / sysName on the switch and gateway (only if snmpget is installed)
+    F_SNMPLOC=""
+    if [ "$C_SNMP" = 1 ] && command -v snmpget >/dev/null 2>&1; then
+        local t loc name
+        for t in $F_MGMT $N_GW; do
+            loc=$(run_for 5 snmpget -v2c -c "$C_COMMUNITY" -t 1 -r 0 -Oqv "$t" 1.3.6.1.2.1.1.6.0 2>/dev/null | tr -d '"')
+            name=$(run_for 5 snmpget -v2c -c "$C_COMMUNITY" -t 1 -r 0 -Oqv "$t" 1.3.6.1.2.1.1.5.0 2>/dev/null | tr -d '"')
+            case "$loc" in ""|*"No Such"*|*Timeout*) continue ;; esac
+            F_SNMPLOC="$loc"; sum "SNMP $t ${name:+($name)}: sysLocation \"$loc\""; break
+        done
+    fi
+
+    # Internet and public IP
+    conn=$(CONNECTION_CHECK 2>/dev/null)
+    F_INET=${conn:-unknown}
+    sum "Internet: $F_INET"
+    F_PUBIP=""; F_ISP=""; F_IPLAT=""; F_IPLON=""; F_CITY=""
+    if [ "$C_IPGEO" = 1 ] && [ "$F_INET" = "Connected" ]; then
+        local j loc
+        j=$(curl -s --max-time 8 "$C_IPGEO_URL" 2>/dev/null | tr -d '\n')
+        F_PUBIP=$(sed -n 's/.*"ip": *"\([^"]*\)".*/\1/p' <<< "$j")
+        F_ISP=$(sed -n 's/.*"org": *"\([^"]*\)".*/\1/p' <<< "$j")
+        F_CITY=$(sed -n 's/.*"city": *"\([^"]*\)".*/\1/p' <<< "$j")
+        loc=$(sed -n 's/.*"loc": *"\([^"]*\)".*/\1/p' <<< "$j")
+        F_IPLAT=${loc%,*}; F_IPLON=${loc#*,}
+        valid_coord "$F_IPLAT" "$F_IPLON" || { F_IPLAT=""; F_IPLON=""; }
+        [ -n "$F_PUBIP" ] && sum "Public IP: $F_PUBIP ${F_ISP:+($F_ISP)} ${F_CITY}"
+    fi
+    if [ -n "$C_HOST" ] && [ "$C_HOST" != "takserver.example.com" ] && [ "$C_PROTO" != udp ]; then
+        if tcp_probe "$C_HOST" "$C_PORT"; then F_TAK="reachable"; else F_TAK="NOT reachable"; fi
+        sum "TAK $C_HOST:$C_PORT: $F_TAK"
+    fi
+
+    remark "Net $N_CIDR GW ${N_GW:-none} DNS ${N_DNS:-none} DHCP srv $F_DHCP"
+    [ -n "$F_SWITCH$F_PORT" ] && remark "Switch ${F_SWITCH:-?} port ${F_PORT:-?} VLAN ${F_VLAN:-?}"
+    remark "Internet ${F_INET}${F_PUBIP:+, public $F_PUBIP}${F_ISP:+ ($F_ISP)}"
+    [ "$F_DHCP" -gt 1 ] 2>/dev/null && remark "ROGUE DHCP? $F_DHCP servers: $servers"
+    S_PARTS+=" fingerprint"
+    step idle
+    LOG "Fingerprint done"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Scan: hosts and services
+# ---------------------------------------------------------------------------
+# nmap XML -> hosts.tsv: ip<TAB>mac<TAB>vendor<TAB>hostname<TAB>ports (22/ssh,80/http)
+parse_nmap_xml() {
+    [ -s "$1" ] || return 0
+    tr -d '\n\r' < "$1" | sed 's#</host>#</host>\n#g' | grep '<host' | awk '
+    function attr(s, name,   re) {
+        re = name "=\"[^\"]*\""
+        if (match(s, re)) return substr(s, RSTART + length(name) + 2, RLENGTH - length(name) - 3)
+        return ""
+    }
+    {
+        ip = ""; mac = ""; ven = ""; hn = ""; ports = ""
+        s = $0
+        while (match(s, /<address [^>]*>/)) {
+            a = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+            t = attr(a, "addrtype")
+            if (t == "ipv4") ip = attr(a, "addr")
+            else if (t == "mac") { mac = attr(a, "addr"); ven = attr(a, "vendor") }
+        }
+        if (match($0, /<hostname [^>]*>/)) hn = attr(substr($0, RSTART, RLENGTH), "name")
+        s = $0
+        while (match(s, /<port [^>]*>/)) {
+            ptag = substr(s, RSTART, RLENGTH); rest = substr(s, RSTART + RLENGTH)
+            e = index(rest, "</port>")
+            if (e > 0) { body = substr(rest, 1, e - 1); s = substr(rest, e + 7) } else { body = rest; s = "" }
+            if (attr(ptag, "protocol") != "tcp") continue
+            if (!match(body, /<state [^>]*>/)) continue
+            if (attr(substr(body, RSTART, RLENGTH), "state") != "open") continue
+            svc = ""
+            if (match(body, /<service [^>]*>/)) svc = attr(substr(body, RSTART, RLENGTH), "name")
+            ports = ports (ports == "" ? "" : ",") attr(ptag, "portid") (svc != "" ? "/" svc : "")
+        }
+        if (ip != "") printf "%s\t%s\t%s\t%s\t%s\n", ip, mac, ven, hn, ports
+    }'
+}
+
+scan_hosts() {
+    ensure_survey; ensure_net || return 1
+    LED ATTACK
+    local target live svc_args=() n
+    target=$(scan_target) || { info "No subnet on eth0"; return 1; }
+    net_basics
+    sum "== Hosts on $target"
+    CREATE_SPINNER "Sweep $target"
+    step "host sweep $target"
+    echo "--- $(date '+%F %T') host sweep $target" >> "$LOGS/vitals.log"
+    vitals_start
+    nmap_low -sn -n -T3 --max-rate "$C_RATE" "$target" --exclude "$N_IP" -oX "$S_DIR/sweep.xml" > /dev/null 2>&1
+    vitals_stop
+    STOP_SPINNER
+    parse_nmap_xml "$S_DIR/sweep.xml" > "$S_DIR/hosts.tsv"
+    cut -f1 "$S_DIR/hosts.tsv" > "$RUN/live.txt"
+    live=$(wc -l < "$RUN/live.txt"); live=${live// /}
+    sum "Live hosts: $live"
+    if [ "$live" -gt 0 ]; then
+        local top_ports=$C_TOP sv=$C_SV nse=$C_NSE bat
+        # A long service scan at full CPU can flatten or brown out the small battery
+        bat=$(BATTERY 2>/dev/null)
+        if [ "$bat" != "Charging" ] && [ "$live" -gt "$C_BIG" ]; then
+            local r; r=$(OPTION_DIALOG "$live hosts on battery may shut the jack off. Plug in USB-C, or scan lighter?" "Lighter" "Continue")
+            if [ "$r" = "Lighter" ]; then top_ports=20; sv=0; nse=0; sum "Lighter scan (battery): top 20 ports, no versions"; fi
+        fi
+        # Gentle on a single 580 MHz core, ~64 MB RAM and an Ethernet chip that locks up under floods:
+        # connect scan, capped packet rate and parallelism, -T3
+        local st=-sT; [ "$C_STYPE" = syn ] && st=-sS
+        local gentle=("$st" -n --open --top-ports "$top_ports" -T3 --max-rate "$C_RATE" --max-parallelism 8 --host-timeout "$C_HTO" --max-retries 1)
+        svc_args=("${gentle[@]}")
+        [ "$sv" = 1 ] && svc_args+=(-sV --version-light)
+        [ "$nse" = 1 ] && nmap_nse && svc_args+=(--script "banner,http-title,ssl-cert,smb-os-discovery,smb2-security-mode,rdp-ntlm-info")
+        # in batches: each one is saved as it finishes, so a shutdown keeps what was done
+        rm -f "$RUN"/batch.* "$S_DIR"/services-*.xml; : > "$S_DIR/services.txt"; : > "$RUN/svc.tsv"
+        awk -v n="$C_BATCH" -v p="$RUN/batch." '{ f = sprintf("%s%03d", p, int((NR - 1) / n)); print > f }' "$RUN/live.txt"
+        local b nb=0 i=0
+        for b in "$RUN"/batch.*; do nb=$((nb + 1)); done
+        CREATE_PROGRESS_BAR "Ports on $live hosts"
+        sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null    # free page cache before the big step
+        echo "--- $(date '+%F %T') service scan, $live hosts, $st, rate $C_RATE" >> "$LOGS/vitals.log"
+        vitals_start
+        for b in "$RUN"/batch.*; do
+            i=$((i + 1))
+            local args=("${svc_args[@]}") mf
+            mf=$(mem_free_kb)
+            if [ "${mf:-0}" -lt "$C_MIN_FREE" ]; then        # low memory: drop version detection / scripts for this batch
+                args=("${gentle[@]}")
+                [ "$i" = 1 ] && [ "$sv" = 1 ] && echo "$(date '+%F %T') ${mf} KB free: ports only, no -sV (needs ${C_MIN_FREE} KB)" >> "$LOGS/history.log"
+                LOG "Low memory (${mf} KB): ports only"
+            fi
+            step "service scan batch $i/$nb ($live hosts, $top_ports ports, ${mf} KB free)"
+            run_for "$C_BATCH_LIMIT" "${NMAP_LOW[@]}" "${args[@]}" -iL "$b" -oX "$S_DIR/services-$(printf '%02d' "$i").xml" >> "$S_DIR/services.txt" 2>&1
+            local brc=$?
+            if [ "$brc" -eq 124 ] || [ "$brc" -eq 143 ] || [ "$brc" -eq 137 ]; then   # timeout (GNU / BusyBox / kill)
+                LOG "Batch $i stopped after ${C_BATCH_LIMIT}s"
+                echo "$(date '+%F %T') batch $i stopped after ${C_BATCH_LIMIT}s" >> "$LOGS/history.log"
+            fi
+            parse_nmap_xml "$S_DIR/services-$(printf '%02d' "$i").xml" >> "$RUN/svc.tsv"
+            sync
+            SET_PROGRESS $(( i * 100 / nb < 100 ? i * 100 / nb : 99 ))
+        done
+        vitals_stop
+        SET_PROGRESS 100
+        # merge: keep MAC/vendor from the sweep, ports from the service scan
+        awk -F'\t' -v OFS='\t' 'NR==FNR { p[$1]=$5; if ($4!="") h[$1]=$4; next }
+            { if ($1 in p) $5=p[$1]; if ($4=="" && ($1 in h)) $4=h[$1]; print }' "$RUN/svc.tsv" "$S_DIR/hosts.tsv" > "$RUN/merged.tsv"
+        mv "$RUN/merged.tsv" "$S_DIR/hosts.tsv"
+    fi
+    sort -t. -k1,1n -k2,2n -k3,3n -k4,4n "$S_DIR/hosts.tsv" -o "$S_DIR/hosts.tsv"
+    while IFS=$'\t' read -r ip mac vendor name ports; do
+        sum "$ip ${name:+$name }${vendor:+[$vendor] }${ports:-no open ports}"
+    done < "$S_DIR/hosts.tsv"
+    # top services: "22x3 80x5 443x7"
+    local top
+    top=$(cut -f5 "$S_DIR/hosts.tsv" | tr ',' '\n' | cut -d/ -f1 | grep . | sort | uniq -c | sort -rn | head -12 \
+          | awk '{printf "%s%sx%s", s, $2, $1; s=" "}')
+    n=$(awk -F'\t' '$5!=""' "$S_DIR/hosts.tsv" | wc -l)
+    remark "Hosts $live on $target, $((n)) with open ports${top:+: $top}"
+    S_PARTS+=" hosts"
+    step idle
+    LOG "Host scan done"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Baseline / rogue diff - one baseline per network (gateway MAC + subnet)
+# ---------------------------------------------------------------------------
+baseline_key() {
+    net_basics
+    local gm=${F_GWMAC}
+    if [ -z "$gm" ] && [ -n "$N_GW" ]; then
+        ping -c 1 -W 1 "$N_GW" >/dev/null 2>&1
+        gm=$(ip neigh show "$N_GW" dev eth0 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="lladdr") print $(i+1)}')
+    fi
+    printf '%s_%s' "${N_CIDR:-nonet}" "${gm:-nogw}" | tr -c 'A-Za-z0-9._-' '_'
+}
+host_key_list() {  # hosts.tsv -> key|ip|vendor|ports  (key = MAC, or IP if no MAC)
+    awk -F'\t' '{ k = ($2 != "") ? toupper($2) : $1; print k "|" $1 "|" $3 "|" $5 }' "$1" | sort -u
+}
+
+baseline_save() {
+    [ -s "$S_DIR/hosts.tsv" ] || { info "Run a host scan first"; return 1; }
+    mkdir -p "$BASELINE_DIR"
+    local key f
+    key=$(baseline_key); f="$BASELINE_DIR/$key.txt"
+    host_key_list "$S_DIR/hosts.tsv" > "$f"
+    note "Baseline saved\n$(wc -l < "$f") devices"
+    LOG "Baseline: $f"
+}
+
+baseline_diff() {
+    ensure_survey
+    [ -s "$S_DIR/hosts.tsv" ] || { scan_hosts || return 1; }
+    local key f new missing changed nn nm nc
+    key=$(baseline_key); f="$BASELINE_DIR/$key.txt"
+    if [ ! -s "$f" ]; then
+        local r
+        r=$(CONFIRMATION_DIALOG "No baseline for this network. Save this scan as baseline?" "Save")
+        [ "$r" = "Save" ] && baseline_save
+        return 0
+    fi
+    host_key_list "$S_DIR/hosts.tsv" > "$RUN/now.txt"
+    new=$(awk -F'|' 'NR==FNR { b[$1]=1; next } !($1 in b)' "$f" "$RUN/now.txt")
+    missing=$(awk -F'|' 'NR==FNR { c[$1]=1; next } !($1 in c)' "$RUN/now.txt" "$f")
+    changed=$(awk -F'|' 'NR==FNR { b[$1]=$4; next } ($1 in b) {
+        split(b[$1], o, ","); split("", had); for (i in o) { split(o[i], q, "/"); had[q[1]]=1 }
+        n = split($4, x, ","); add = ""
+        for (i = 1; i <= n; i++) { split(x[i], q, "/"); if (q[1] != "" && !(q[1] in had)) add = add (add==""?"":",") q[1] }
+        if (add != "") print $2 " +" add }' "$f" "$RUN/now.txt")
+    nn=$(grep -c . <<< "$new"); nm=$(grep -c . <<< "$missing"); nc=$(grep -c . <<< "$changed")
+    {
+        echo "== Baseline diff vs $(date -r "$f" '+%F %T' 2>/dev/null) ($key)"
+        echo "NEW devices: $nn";      [ -n "$new" ] && tr '|' ' ' <<< "$new"
+        echo "MISSING devices: $nm";  [ -n "$missing" ] && tr '|' ' ' <<< "$missing"
+        echo "New open ports: $nc";   [ -n "$changed" ] && printf '%s\n' "$changed"
+    } > "$S_DIR/diff.txt"
+    cat "$S_DIR/diff.txt" >> "$S_DIR/summary.txt"
+    cut -d'|' -f1 <<< "$new" | grep . > "$RUN/new_keys.txt"
+    if [ "$nn" -gt 0 ] || [ "$nc" -gt 0 ]; then
+        S_ALERT=1; LED SPECIAL
+        remark "BASELINE: $nn NEW, $nm missing, $nc with new ports$( [ "$nn" -gt 0 ] && printf ' - new: %s' "$(awk -F'|' 'NR <= 5 { v = $2 ($3 != "" ? " " $3 : ""); printf "%s%s", s, v; s = "; " }' <<< "$new")")"
+    else
+        remark "Baseline: no new devices ($nm missing)"
+    fi
+    S_PARTS+=" diff"
+    info "Baseline diff\nNew: $nn\nMissing: $nm\nNew ports: $nc"
+}
+
+# ---------------------------------------------------------------------------
+# Scan: packet capture
+# ---------------------------------------------------------------------------
+scan_pcap() {
+    ensure_survey; ensure_net || return 1
+    need_pkg tcpdump tcpdump "Packet capture" || return 1
+    LED ATTACK
+    local f="$S_DIR/capture.pcap" i pkts size
+    step "packet capture ${C_PCAP_S}s"
+    tcpdump -i eth0 -n -s 0 -c "$C_PCAP_N" -w "$f" > /dev/null 2> "$LOGS/tcpdump.log" &
+    local pid=$!
+    CREATE_PROGRESS_BAR "Capture ${C_PCAP_S}s"
+    for ((i = 1; i <= C_PCAP_S; i++)); do
+        sleep 1; kill -0 "$pid" 2>/dev/null || break
+        SET_PROGRESS $(( i * 100 / C_PCAP_S < 99 ? i * 100 / C_PCAP_S : 99 ))
+    done
+    kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    SET_PROGRESS 100
+    pkts=$(grep -o '[0-9]* packets captured' "$LOGS/tcpdump.log" | awk '{print $1}')
+    size=$(wc -c < "$f" 2>/dev/null); size=$(( ${size:-0} / 1024 ))
+    sum "== Packet capture: ${pkts:-?} packets, ${size} KB in ${C_PCAP_S}s"
+    remark "pcap ${C_PCAP_S}s ${pkts:-?} pkts ${size}KB"
+    S_PARTS+=" pcap"
+    step idle
+}
+
+# ---------------------------------------------------------------------------
+# Location
+# ---------------------------------------------------------------------------
+# sets P_LAT P_LON P_CE P_SRC
+site_get() { awk -F'|' -v n="$1" '$1==n {print $2 " " $3; exit}' "$SITES_FILE" 2>/dev/null; }
+
+atak_anchor() {  # position of C_MY_ATAK from the TAK Server (contacts listen, then REST fallback)
+    [ -n "$C_MY_ATAK" ] || return 1
+    [ "$C_PROTO" = udp ] && return 1
+    tak_listen quiet >/dev/null 2>&1
+    local line cs uid lat lon ce t now
+    now=$(date +%s)
+    line=$(awk -F'|' -v n="$C_MY_ATAK" 'tolower($1)==tolower(n) {print; exit}' "$CONTACTS_FILE" 2>/dev/null)
+    if [ -n "$line" ]; then
+        IFS='|' read -r cs uid lat lon ce t <<< "$line"
+        if ! valid_coord "$lat" "$lon" && [ "$C_PROTO" = tls ] && [ -n "$uid" ]; then
+            rest_cot "$uid" && { lat=$R_LAT; lon=$R_LON; ce=$R_CE; t=$R_T; }
+        fi
+        if valid_coord "$lat" "$lon"; then
+            if [ -n "$t" ] && [ $((now - t)) -gt "$C_ANCHOR_AGE" ]; then
+                LOG "ATAK position is $(( (now - t) / 60 )) min old - not used"; return 1
+            fi
+            P_LAT=$lat; P_LON=$lon
+            P_CE=$(awk -v c="${ce:-10}" 'BEGIN { c += 0; if (c <= 0 || c > 9000000) c = 10; printf "%.1f", c + 5 }')
+            P_SRC="ATAK anchor ($cs$( [ -n "$t" ] && printf ', %s min old' $(( (now - t) / 60 )) ))"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+locate() {  # locate [mode]
+    local mode=${1:-$C_LOC_MODE} ll
+    P_LAT=""; P_LON=""; P_CE=""; P_SRC=""
+    case "$mode" in
+        auto)
+            if [ -n "$F_MED_LAT" ]; then P_LAT=$F_MED_LAT; P_LON=$F_MED_LON; P_CE=30; P_SRC="LLDP-MED (switch)"; return 0; fi
+            atak_anchor && return 0
+            locate site && return 0
+            locate manual && return 0
+            locate text && return 0
+            locate ip && return 0
+            ;;
+        atak)   atak_anchor && return 0 ;;
+        site)
+            ll=$(site_get "$C_SITE")
+            if [ -n "$ll" ]; then P_LAT=${ll% *}; P_LON=${ll#* }; P_CE=25; P_SRC="site $C_SITE"; return 0; fi ;;
+        manual)
+            if valid_coord "$C_MAN_LAT" "$C_MAN_LON"; then P_LAT=$C_MAN_LAT; P_LON=$C_MAN_LON; P_CE=25; P_SRC="manual"; return 0; fi ;;
+        text)
+            ll=$(coords_in_text "$F_SNMPLOC $F_LOCTXT")
+            if [ -n "$ll" ]; then P_LAT=${ll% *}; P_LON=${ll#* }; P_CE=100; P_SRC="switch location text"; return 0; fi ;;
+        ip)
+            if [ -z "$F_IPLAT" ] && [ "$C_IPGEO" = 1 ]; then
+                local j loc; j=$(curl -s --max-time 8 "$C_IPGEO_URL" 2>/dev/null | tr -d '\n')
+                loc=$(sed -n 's/.*"loc": *"\([^"]*\)".*/\1/p' <<< "$j"); F_IPLAT=${loc%,*}; F_IPLON=${loc#*,}
+                valid_coord "$F_IPLAT" "$F_IPLON" || { F_IPLAT=""; F_IPLON=""; }
+            fi
+            if [ -n "$F_IPLAT" ]; then P_LAT=$F_IPLAT; P_LON=$F_IPLON; P_CE=25000; P_SRC="public IP (city level)"; return 0; fi ;;
+    esac
+    # last known position as a final fallback
+    if [ "$mode" = auto ] && [ -s "$BASE_DIR/last_pos" ]; then
+        read -r P_LAT P_LON P_CE < "$BASE_DIR/last_pos"
+        valid_coord "$P_LAT" "$P_LON" && { P_SRC="last known"; return 0; }
+    fi
+    return 1
+}
+
+resolve_location() {
+    if locate; then
+        printf '%s %s %s\n' "$P_LAT" "$P_LON" "$P_CE" > "$BASE_DIR/last_pos"
+        LOG "Loc: $P_SRC"
+        return 0
+    fi
+    local r
+    r=$(OPTION_DIALOG "No location. Enter one?" "Manual" "Skip")
+    if [ "$r" = "Manual" ] && set_manual; then locate manual && return 0; fi
+    P_LAT=0; P_LON=0; P_CE=9999999; P_SRC="unknown"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# CoT
+# ---------------------------------------------------------------------------
+# Events are stored with @@TIME@@ / @@STALE@@ / @@DEST@@ so queued results get fresh times when sent.
+cot_survey() {  # cot_survey uid -> survey marker
+    local uid=$1 remarks cs type
+    remarks="SharkTAKDisplay survey $(date '+%F %H:%M') | Loc: $P_SRC"
+    local r; for r in "${S_REMARKS[@]}"; do remarks+=" | $r"; done
+    [ -n "$F_SNMPLOC" ] && remarks+=" | SNMP location: $F_SNMPLOC"
+    [ -n "$F_LOCTXT" ] && remarks+=" | LLDP location: $F_LOCTXT"
+    remarks+=" | Full results in the data package (${S_TS})"
+    type="a-f-G-E-S"; [ "$S_ALERT" = 1 ] && type="a-u-G-E-S"     # yellow (unknown) when something needs a look
+    cs="${C_CALLSIGN} ${S_TS#*-}"
+    printf '%s' "<event version=\"2.0\" uid=\"$uid\" type=\"$type\" how=\"h-e\" time=\"@@TIME@@\" start=\"@@TIME@@\" stale=\"@@STALE@@\">"\
+"<point lat=\"$P_LAT\" lon=\"$P_LON\" hae=\"9999999.0\" ce=\"$P_CE\" le=\"9999999.0\"/>"\
+"<detail><contact callsign=\"$(xml_esc "$cs")\"/>"\
+"<precisionlocation geopointsrc=\"$(xml_esc "${P_SRC%% (*}")\" altsrc=\"???\"/>"\
+"<remarks>$(xml_esc "${remarks:0:3500}")</remarks>"\
+"<link uid=\"$C_UID\" production_time=\"@@TIME@@\" type=\"a-f-G-E-S\" parent_callsign=\"$(xml_esc "$C_CALLSIGN")\" relation=\"p-p\"/>"\
+"<__sharktakdisplay version=\"$PAYLOAD_VERSION\" survey=\"$S_TS\" parts=\"${S_PARTS# }\" alert=\"$S_ALERT\"/>"\
+"@@DEST@@</detail></event>"
+}
+
+cot_presence() {  # the jack itself, so it shows as a contact while it talks to TAK
+    local lat=${P_LAT:-0} lon=${P_LON:-0} ce=${P_CE:-9999999}
+    valid_coord "$lat" "$lon" || { lat=0; lon=0; ce=9999999; }
+    printf '%s' "<event version=\"2.0\" uid=\"$C_UID\" type=\"a-f-G-E-S\" how=\"h-e\" time=\"@@TIME@@\" start=\"@@TIME@@\" stale=\"@@STALE5@@\">"\
+"<point lat=\"$lat\" lon=\"$lon\" hae=\"9999999.0\" ce=\"$ce\" le=\"9999999.0\"/>"\
+"<detail><takv device=\"Shark Jack Display\" platform=\"$PRODUCT_NAME\" os=\"Linux\" version=\"$PAYLOAD_VERSION\"/>"\
+"<contact callsign=\"$(xml_esc "$C_CALLSIGN")\" endpoint=\"*:-1:stcp\"/><uid Droid=\"$(xml_esc "$C_CALLSIGN")\"/>"\
+"<__group name=\"$(xml_esc "$C_TEAM")\" role=\"$(xml_esc "$C_ROLE")\"/><status battery=\"100\"/>"\
+"<remarks>Shark Jack Display network survey kit</remarks></detail></event>"
+}
+
+cot_hosts() {  # one marker per host in a ring around the jack -> hosts.cot (one event per line)
+    [ -s "$S_DIR/hosts.tsv" ] || return 0
+    awk -F'\t' -v lat="$P_LAT" -v lon="$P_LON" -v r="$C_RING" -v max="$C_MAX_HM" -v ts="$S_TS" -v news="$RUN/new_keys.txt" '
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s); return s }
+    BEGIN { while ((getline k < news) > 0) isnew[k] = 1 }
+    { ip[NR]=$1; mac[NR]=$2; ven[NR]=$3; nm[NR]=$4; pt[NR]=$5 }
+    END {
+        n = (NR < max) ? NR : max; pi = 3.14159265
+        for (i = 1; i <= n; i++) {
+            a = 2 * pi * (i - 1) / n
+            la = lat + (r * cos(a)) / 111320; lo = lon + (r * sin(a)) / (111320 * cos(lat * pi / 180))
+            key = (mac[i] != "") ? toupper(mac[i]) : ip[i]
+            t = (key in isnew) ? "a-u-G" : "a-n-G"
+            id = mac[i]; if (id == "") id = ip[i]; gsub(/[^A-Za-z0-9]/, "", id)
+            rem = "IP " ip[i] (nm[i] != "" ? " " nm[i] : "") (mac[i] != "" ? " MAC " mac[i] : "") (ven[i] != "" ? " (" ven[i] ")" : "") \
+                  " | open: " (pt[i] != "" ? pt[i] : "none") ((key in isnew) ? " | NEW since baseline" : "") \
+                  " | SharkTAKDisplay " ts " - marker placed in a ring around the jack, not the device position"
+            label = (nm[i] != "") ? nm[i] : ip[i]
+            printf "<event version=\"2.0\" uid=\"SharkTAKDisplay-host-%s\" type=\"%s\" how=\"h-e\" time=\"@@TIME@@\" start=\"@@TIME@@\" stale=\"@@STALE@@\">", id, t
+            printf "<point lat=\"%.7f\" lon=\"%.7f\" hae=\"9999999.0\" ce=\"%s\" le=\"9999999.0\"/>", la, lo, r
+            printf "<detail><contact callsign=\"%s\"/><remarks>%s</remarks>@@DEST@@</detail></event>\n", esc(label), esc(rem)
+        }
+    }' "$S_DIR/hosts.tsv" > "$S_DIR/hosts.cot"
+}
+
+cot_chat() {  # cot_chat "message" -> All Chat Rooms
+    local msg now mid cs
+    msg=$(xml_esc "$1"); cs=$(xml_esc "$C_CALLSIGN"); mid=$(new_id)
+    printf '%s' "<event version=\"2.0\" uid=\"GeoChat.$C_UID.All Chat Rooms.$mid\" type=\"b-t-f\" how=\"h-g-i-g-o\" time=\"@@TIME@@\" start=\"@@TIME@@\" stale=\"@@STALE@@\">"\
+"<point lat=\"${P_LAT:-0}\" lon=\"${P_LON:-0}\" hae=\"9999999.0\" ce=\"9999999.0\" le=\"9999999.0\"/>"\
+"<detail><__chat parent=\"RootContactGroup\" groupOwner=\"false\" messageId=\"$mid\" chatroom=\"All Chat Rooms\" id=\"All Chat Rooms\" senderCallsign=\"$cs\">"\
+"<chatgrp uid0=\"$C_UID\" uid1=\"All Chat Rooms\" id=\"All Chat Rooms\"/></__chat>"\
+"<link uid=\"$C_UID\" type=\"a-f-G-E-S\" relation=\"p-p\"/>"\
+"<remarks source=\"BAO.F.ATAK.$C_UID\" to=\"All Chat Rooms\" time=\"@@TIME@@\">$msg</remarks>"\
+"<__serverdestination destinations=\"0.0.0.0:4242:tcp:$C_UID\"/></detail></event>"
+}
+
+cot_fileshare() {  # cot_fileshare name url size sha256 -> b-f-t-r
+    printf '%s' "<event version=\"2.0\" uid=\"$(new_id)\" type=\"b-f-t-r\" how=\"h-e\" time=\"@@TIME@@\" start=\"@@TIME@@\" stale=\"@@STALE10@@\">"\
+"<point lat=\"${P_LAT:-0}\" lon=\"${P_LON:-0}\" hae=\"9999999.0\" ce=\"9999999.0\" le=\"9999999.0\"/><detail>"\
+"<fileshare filename=\"$(xml_esc "$1")\" senderUrl=\"$(xml_esc "$2")\" sizeInBytes=\"$3\" sha256=\"$4\""\
+" senderUid=\"$C_UID\" senderCallsign=\"$(xml_esc "$C_CALLSIGN")\" name=\"$(xml_esc "${1%.zip}")\"/>"\
+"<ackrequest uid=\"$(new_id)\" ackrequested=\"true\" tag=\"$(xml_esc "${1%.zip}")\"/>@@DEST@@</detail></event>"
+}
+
+# fill_cot "dest xml" < template -> real event(s)
+fill_cot() {
+    local now t s s5 s10 d
+    now=$(date +%s); t=$(iso_time "$now"); s=$(iso_time $((now + C_STALE_H * 3600)))
+    s5=$(iso_time $((now + 300))); s10=$(iso_time $((now + 600))); d=$1
+    d=${d//&/\\&}; d=${d//|/\\|}
+    sed "s|@@TIME@@|$t|g; s|@@STALE@@|$s|g; s|@@STALE5@@|$s5|g; s|@@STALE10@@|$s10|g; s|@@DEST@@|$d|g"
+}
+marti_dest() {  # marti_dest callsign uid
+    [ -n "$1" ] && printf '<marti><dest callsign="%s"/></marti>' "$(xml_esc "$1")"
+}
+
+
+# Zip writer with no zip package: OpenWrt 23.05 has no "zip" for this chip. Each file is
+# compressed with the firmware's gzip, and its deflate data + CRC-32 are wrapped in zip headers
+# (zip and gzip share the same deflate format and CRC-32).
+le16() { printf '\\x%02x\\x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )); }
+le32() { printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+bytes_at() {  # bytes_at file offset count -> decimal byte values (od, hexdump, or plain Bash)
+    if command -v od >/dev/null 2>&1; then
+        od -An -tu1 -j "$2" -N "$3" "$1"
+    elif command -v hexdump >/dev/null 2>&1; then
+        hexdump -s "$2" -n "$3" -e '1/1 "%u "' "$1"; echo
+    else
+        local c out="" i
+        for ((i = 0; i < $3; i++)); do
+            LC_ALL=C IFS= read -r -d '' -n 1 c || c=""
+            out+="$(LC_ALL=C printf '%d' "'$c") "
+        done < <(tail -c +$(($2 + 1)) "$1" | head -c "$3")
+        echo "$out"
+    fi
+}
+u32_at() {  # u32_at file offset - little-endian 32-bit value
+    # Bash math (64-bit): BusyBox awk's %d tops out at 2147483647 and corrupted half the CRCs
+    local b0 b1 b2 b3
+    read -r b0 b1 b2 b3 <<< "$(bytes_at "$1" "$2" 4)"
+    echo $(( b0 + (b1 << 8) + (b2 << 16) + (b3 << 24) ))
+}
+mkzip_sh() {  # mkzip_sh out.zip dir path... (paths relative to dir; folders are walked)
+    local out=$1 dir=$2; shift 2
+    local tmp="$RUN/mkzip.$$" cd="$RUN/mkzip.cd.$$" f gz size gsz crc csize off=0 n=0 name flg dt dd
+    : > "$tmp.out"; : > "$cd"
+    # DOS date/time of "now"
+    # 10#: "08" and "09" are not octal (Bash would abort the payload on them)
+    local Y M D h m sec
+    read -r Y M D h m sec <<< "$(date '+%Y %m %d %H %M %S')"
+    dt=$(( (10#$h << 11) | (10#$m << 5) | (10#$sec / 2) ))
+    dd=$(( ((10#$Y - 1980) << 9) | (10#$M << 5) | 10#$D ))
+    while IFS= read -r name; do
+        f="$dir/$name"
+        gzip -c < "$f" > "$tmp.gz" || { echo "gzip failed: $name" >&2; return 1; }
+        flg=$(bytes_at "$tmp.gz" 3 1 | tr -d ' ')
+        [ "$flg" = 0 ] || { echo "unexpected gzip header ($flg): $name" >&2; return 1; }   # plain 10-byte header expected
+        gsz=$(wc -c < "$tmp.gz"); gsz=${gsz// /}
+        size=$(wc -c < "$f"); size=${size// /}
+        crc=$(u32_at "$tmp.gz" $((gsz - 8)))
+        csize=$((gsz - 18))
+        # local file header + deflate data
+        printf "PK\\003\\004$(le16 20)$(le16 0)$(le16 8)$(le16 $dt)$(le16 $dd)$(le32 $crc)$(le32 $csize)$(le32 $size)$(le16 ${#name})$(le16 0)" >> "$tmp.out"
+        printf '%s' "$name" >> "$tmp.out"
+        tail -c +11 "$tmp.gz" | head -c "$csize" >> "$tmp.out"
+        # central directory entry
+        printf "PK\\001\\002$(le16 20)$(le16 20)$(le16 0)$(le16 8)$(le16 $dt)$(le16 $dd)$(le32 $crc)$(le32 $csize)$(le32 $size)$(le16 ${#name})$(le16 0)$(le16 0)$(le16 0)$(le16 0)$(le32 0)$(le32 $off)" >> "$cd"
+        printf '%s' "$name" >> "$cd"
+        off=$(( off + 30 + ${#name} + csize ))
+        n=$((n + 1))
+    done < <(cd "$dir" && find "$@" -type f | sed 's#^\./##' | sort)
+    local cdsize; cdsize=$(wc -c < "$cd"); cdsize=${cdsize// /}
+    cat "$cd" >> "$tmp.out"
+    printf "PK\\005\\006$(le16 0)$(le16 0)$(le16 $n)$(le16 $n)$(le32 $cdsize)$(le32 $off)$(le16 0)" >> "$tmp.out"
+    mv "$tmp.out" "$out"
+    rm -f "$tmp.gz" "$cd"
+    [ "$n" -gt 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Data package (MANIFEST v2, results attached to the survey marker)
+# ---------------------------------------------------------------------------
+build_package() {  # build_package marker_uid -> sets PKG_ZIP PKG_NAME
+    local muid=$1 pdir="$RUN/pkg-$S_TS" sub f
+    mkdir -p "$LOGS"
+    PKG_NAME="SharkTAKDisplay-${S_TS}.zip"; PKG_ZIP="$S_DIR/$PKG_NAME"
+    sub=$(new_id)
+    rm -rf "${pdir:?}"; mkdir -p "$pdir/MANIFEST" "$pdir/$sub"
+    cot_survey "$muid" | fill_cot "" | sed 's|^|<?xml version="1.0" encoding="UTF-8" standalone="yes"?>|' > "$pdir/$sub/survey.cot"
+    for f in summary.txt hosts.tsv diff.txt services.txt sweep.xml dhcp.txt lldp.txt capture.pcap; do
+        [ -s "$S_DIR/$f" ] && cp "$S_DIR/$f" "$pdir/$sub/"
+    done
+    for f in "$S_DIR"/services-*.xml; do [ -s "$f" ] && cp "$f" "$pdir/$sub/"; done
+    {
+        echo '<MissionPackageManifest version="2">'
+        echo ' <Configuration>'
+        echo "  <Parameter name=\"uid\" value=\"$(new_id)\"/>"
+        echo "  <Parameter name=\"name\" value=\"${PKG_NAME%.zip}\"/>"
+        echo '  <Parameter name="onReceiveDelete" value="false"/>'
+        echo ' </Configuration>'
+        echo ' <Contents>'
+        echo "  <Content ignore=\"false\" zipEntry=\"$sub/survey.cot\"><Parameter name=\"uid\" value=\"$muid\"/></Content>"
+        for f in "$pdir/$sub"/*; do
+            f=${f##*/}; [ "$f" = survey.cot ] && continue
+            echo "  <Content ignore=\"false\" zipEntry=\"$sub/$f\"><Parameter name=\"uid\" value=\"$muid\"/></Content>"
+        done
+        echo ' </Contents>'
+        echo '</MissionPackageManifest>'
+    } > "$pdir/MANIFEST/manifest.xml"
+    rm -f "$PKG_ZIP"
+    if command -v zip >/dev/null 2>&1; then
+        ( cd "$pdir" && zip -q -r "$PKG_ZIP" MANIFEST "$sub" ) || { rm -rf "${pdir:?}"; info "zip failed"; return 1; }
+    else
+        mkzip_sh "$PKG_ZIP" "$pdir" MANIFEST "$sub" 2> "$LOGS/zipcheck.log" || { rm -rf "${pdir:?}"; info "Package build failed\nSee $LOGS/zipcheck.log\nResults are in loot"; return 1; }
+    fi
+    if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$PKG_ZIP" > "$LOGS/zipcheck.log" 2>&1; then
+        rm -f "${PKG_ZIP:?}"; rm -rf "${pdir:?}"; info "Package check failed\nSee $LOGS/zipcheck.log\nResults are in loot"; return 1
+    fi
+    rm -rf "${pdir:?}"
+    LOG "Package $((($(wc -c < "$PKG_ZIP") + 1023) / 1024)) KB"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# TAK link
+# ---------------------------------------------------------------------------
+tls_args() {
+    TLS_ARGS=(-brief -connect "$C_HOST:$C_PORT" -cert "$CERT_DIR/$CLIENT_PEM" -key "$CERT_DIR/$CLIENT_PEM")
+    [[ $C_HOST =~ ^[0-9.]+$ ]] || TLS_ARGS+=(-servername "$C_HOST")
+    [ -s "$CERT_DIR/$CA_PEM" ] && TLS_ARGS+=(-CAfile "$CERT_DIR/$CA_PEM" -verify_return_error)
+}
+curl_tls() {
+    CURL_TLS=()
+    if [ "$C_PROTO" = tls ]; then
+        CURL_TLS=(--cert "$CERT_DIR/$CLIENT_PEM" --key "$CERT_DIR/$CLIENT_PEM")
+        if [ -s "$CERT_DIR/$CA_PEM" ]; then CURL_TLS+=(--cacert "$CERT_DIR/$CA_PEM"); else CURL_TLS+=(-k); fi
+        API_BASE="https://$C_HOST:$C_API_PORT"
+    else
+        API_BASE="http://$C_HOST:$C_API_PORT"
+    fi
+}
+
+tak_ready() {  # config + certs present
+    if [ -z "$C_HOST" ] || [ "$C_HOST" = "takserver.example.com" ]; then
+        LAST_ERR="Set the TAK server (Settings)"; return 1
+    fi
+    if [ "$C_PROTO" = tls ]; then
+        command -v openssl >/dev/null 2>&1 || need_pkg openssl openssl-util "TLS to TAK" || { LAST_ERR="openssl missing"; return 1; }
+        setup_certs || { LAST_ERR="No TAK certificate"; return 1; }
+    fi
+    return 0
+}
+
+RX_MAX=$((512 * 1024))   # most a TAK session may hold in RAM (/tmp)
+
+# tak_session events_file listen_seconds -> sends, then listens; writes $RUN/rx. 0 = connected
+tak_session() {
+    local ev=$1 listen=${2:-$C_LISTEN} rc=0
+    mkdir -p "$LOGS"
+    : > "$RUN/rx"; LAST_ERR=""
+    [ "$C_PROTO" != udp ] && { tcp_probe "$C_HOST" "$C_PORT" || { LAST_ERR="$C_HOST:$C_PORT no answer"; return 1; }; }
+    case "$C_PROTO" in
+        tls)
+            tls_args
+            # the sleep is the listen window; end of input then closes the session (-brief, no -ign_eof)
+            { cat "$ev"; sleep "$listen"; } | run_for $((listen + 8)) openssl s_client "${TLS_ARGS[@]}" 2> "$LOGS/ssl.log" | head -c "$RX_MAX" > "$RUN/rx"
+            if ! grep -q 'CONNECTION ESTABLISHED' "$LOGS/ssl.log" \
+               || grep -qiE 'verify error|alert (bad|unknown|handshake|certificate)' "$LOGS/ssl.log"; then
+                LAST_ERR=$(grep -iE -m1 'error|alert|unable|fail|mismatch' "$LOGS/ssl.log" | sed 's/^[0-9A-F]*:error:[0-9A-F]*://' | cut -c1-60)
+                LAST_ERR=${LAST_ERR:-TLS handshake failed}
+                rc=1
+            fi ;;
+        tcp)
+            if have_devtcp; then
+                exec 3<>"/dev/tcp/$C_HOST/$C_PORT" 2>/dev/null || { LAST_ERR="TCP connect failed"; return 1; }
+                { cat <&3 | head -c "$RX_MAX" > "$RUN/rx"; } & local rp=$!
+                cat "$ev" >&3 || rc=1
+                sleep "$listen"; kill "$rp" 2>/dev/null; exec 3>&-
+            else
+                command -v nc >/dev/null 2>&1 || { LAST_ERR="No /dev/tcp or nc for TCP"; return 1; }
+                { cat "$ev"; sleep "$listen"; } | run_for $((listen + 5)) nc "$C_HOST" "$C_PORT" 2>/dev/null | head -c "$RX_MAX" > "$RUN/rx"
+            fi ;;
+        udp)
+            if have_devtcp; then
+                exec 3>"/dev/udp/$C_HOST/$C_PORT" 2>/dev/null || { LAST_ERR="UDP open failed"; return 1; }
+                while IFS= read -r line; do [ -n "$line" ] && printf '%s\n' "$line" >&3; done < "$ev"
+                exec 3>&-
+            else
+                command -v nc >/dev/null 2>&1 || { LAST_ERR="No /dev/udp or nc for UDP"; return 1; }
+                while IFS= read -r line; do [ -n "$line" ] && printf '%s\n' "$line" | run_for 2 nc -u "$C_HOST" "$C_PORT"; done < "$ev"
+            fi ;;
+        *) LAST_ERR="Unknown protocol $C_PROTO"; return 1 ;;
+    esac
+    # /tmp is RAM: log what the server pushed, keep only the contacts, free the rest
+    local rxkb=$(( $(wc -c < "$RUN/rx" 2>/dev/null || echo 0) / 1024 ))
+    echo "$(date '+%F %T') TAK rx ${rxkb} KB in ${listen}s, free $(mem_free_kb) KB" >> "$LOGS/history.log"
+    [ -s "$RUN/rx" ] && parse_contacts "$RUN/rx"
+    rm -f "$RUN/rx"
+    return $rc
+}
+
+# Received SA -> contacts file (callsign|uid|lat|lon|ce|epoch). Real clients carry takv or an endpoint.
+parse_contacts() {
+    local ev uid cs lat lon ce t te
+    touch "$CONTACTS_FILE"
+    sed 's#</event>#</event>\n#g' "$1" | grep '<contact ' | while IFS= read -r ev; do
+        [[ $ev == *"<takv"* || $ev == *"endpoint="* ]] || continue
+        [[ $ev =~ $RE_EV_UID ]] && uid=${BASH_REMATCH[1]} || continue
+        [ "$uid" = "$C_UID" ] && continue
+        [[ $ev =~ $RE_CS ]] && cs=$(xml_unesc "${BASH_REMATCH[1]}") || continue
+        lat=""; lon=""; ce=""; t=""
+        [[ $ev =~ $RE_PT_LAT ]] && lat=${BASH_REMATCH[1]}
+        [[ $ev =~ $RE_PT_LON ]] && lon=${BASH_REMATCH[1]}
+        [[ $ev =~ $RE_PT_CE ]] && ce=${BASH_REMATCH[1]}
+        [[ $ev =~ $RE_EV_TIME ]] && te=${BASH_REMATCH[1]} && t=$(iso_epoch "$te")
+        printf '%s|%s|%s|%s|%s|%s\n' "${cs//|/ }" "$uid" "$lat" "$lon" "$ce" "$t"
+    done > "$RUN/contacts.new"
+    [ -s "$RUN/contacts.new" ] || return 0
+    # newest wins per uid
+    cat "$RUN/contacts.new" "$CONTACTS_FILE" | awk -F'|' '!seen[$2]++' > "$RUN/contacts.m" && mv "$RUN/contacts.m" "$CONTACTS_FILE"
+}
+
+# REST fallbacks (cert only): contact list and one user's latest CoT
+rest_contacts() {
+    [ "$C_PROTO" = tls ] || return 1
+    curl_tls
+    curl -s --max-time 15 "${CURL_TLS[@]}" "$API_BASE/Marti/api/contacts/all" 2>/dev/null \
+        | sed 's/} *, *{/}\n{/g' | while IFS= read -r o || [ -n "$o" ]; do
+            local u c
+            u=$(sed -n 's/.*"uid" *: *"\([^"]*\)".*/\1/p' <<< "$o"); c=$(sed -n 's/.*"callsign" *: *"\([^"]*\)".*/\1/p' <<< "$o")
+            [ -n "$u" ] && [ -n "$c" ] && [ "$u" != "$C_UID" ] && printf '%s|%s||||\n' "${c//|/ }" "$u"
+        done > "$RUN/rest.txt"
+    [ -s "$RUN/rest.txt" ] || return 1
+    cat "$CONTACTS_FILE" "$RUN/rest.txt" 2>/dev/null | awk -F'|' '!seen[$2]++' > "$RUN/contacts.m" && mv "$RUN/contacts.m" "$CONTACTS_FILE"
+}
+rest_cot() {  # rest_cot uid -> R_LAT R_LON R_CE R_T
+    curl_tls
+    local x
+    x=$(curl -s --max-time 15 "${CURL_TLS[@]}" "$API_BASE/Marti/api/cot/xml/$1" 2>/dev/null | tr -d '\n')
+    R_LAT=""; R_LON=""; R_CE=""; R_T=""
+    [[ $x =~ $RE_PT_LAT ]] && R_LAT=${BASH_REMATCH[1]} || return 1
+    [[ $x =~ $RE_PT_LON ]] && R_LON=${BASH_REMATCH[1]}
+    [[ $x =~ $RE_PT_CE ]] && R_CE=${BASH_REMATCH[1]}
+    [[ $x =~ $RE_EV_TIME ]] && R_T=$(iso_epoch "${BASH_REMATCH[1]}")
+    valid_coord "$R_LAT" "$R_LON"
+}
+
+tak_listen() {  # refresh contacts: send our presence, listen
+    ensure_net || return 1
+    tak_ready || return 1
+    cot_presence | fill_cot "" > "$RUN/presence.cot"; echo >> "$RUN/presence.cot"
+    LED STAGE2
+    [ "$1" = quiet ] || CREATE_SPINNER "TAK contacts ${C_LISTEN}s"
+    tak_session "$RUN/presence.cot" "$C_LISTEN"; local rc=$?
+    [ "$1" = quiet ] || STOP_SPINNER
+    [ "$C_PROTO" = tls ] && rest_contacts
+    return $rc
+}
+
+upload_package() {  # upload_package zip [name] -> PKG_URL PKG_HASH PKG_SIZE
+    curl_tls
+    local name=${2:-${1##*/}} url
+    PKG_HASH=$(sha256sum "$1" | awk '{print $1}'); PKG_SIZE=$(wc -c < "$1"); PKG_SIZE=${PKG_SIZE// /}
+    url=$(curl -sS --fail --max-time 180 "${CURL_TLS[@]}" \
+          -F "assetfile=@$1;filename=$name;type=application/x-zip-compressed" \
+          "$API_BASE/Marti/sync/missionupload?hash=$PKG_HASH&filename=$name&creatorUid=$C_UID" 2> "$LOGS/upload.log")
+    [ $? -eq 0 ] && [ -n "$url" ] || { LAST_ERR="Upload failed ($API_BASE)"; return 1; }
+    PKG_URL=$(tr -d '\r\n' <<< "$url")
+    [[ $PKG_URL == http* ]] || PKG_URL="$API_BASE/Marti/api/sync/metadata/$PKG_HASH/tool"
+    # list it in the server's Data Packages
+    curl -sS --max-time 30 "${CURL_TLS[@]}" -X PUT -H "Content-Type: text/plain" --data "public" \
+        "$API_BASE/Marti/api/sync/metadata/$PKG_HASH/tool" >> "$LOGS/upload.log" 2>&1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Queue: every result is a queue item, sent now or later
+#   item dir: survey.cot  hosts.cot  chat.cot  package.zip  meta (MODE DEST_CS DEST_UID NAME)
+#   MODE: all = marker + package to everyone | contact = to DEST_CS only | upload = marker to all, package on server only
+# ---------------------------------------------------------------------------
+queue_survey() {  # queue_survey mode [dest_cs dest_uid]
+    local mode=$1 q="$QUEUE_DIR/$S_TS-${S_ID:0:8}" muid="SharkTAKDisplay-survey-$S_ID"
+    mkdir -p "$q"
+    cot_survey "$muid" > "$q/survey.cot"
+    if [ "$C_HOST_MARKERS" = 1 ] && [ -s "$S_DIR/hosts.tsv" ]; then cot_hosts; cp "$S_DIR/hosts.cot" "$q/hosts.cot"; fi
+    if [ "$S_ALERT" = 1 ] && [ "$C_CHAT_ALERT" = 1 ] && [ "$mode" != contact ]; then
+        cot_chat "SharkTAKDisplay $C_CALLSIGN: survey needs a look - ${S_REMARKS[*]: -1}" > "$q/chat.cot"
+    fi
+    step "building data package"
+    build_package "$muid" && cp "$PKG_ZIP" "$q/package.zip"
+    step idle
+    printf 'MODE=%s\nDEST_CS=%s\nDEST_UID=%s\nNAME=%s\n' "$mode" "$2" "$3" "SharkTAKDisplay-${S_TS}.zip" > "$q/meta"
+    LOG "Queued $S_TS ($mode${2:+ to $2})"
+}
+
+send_item() {  # send_item dir -> 0 sent
+    local q=$1 MODE DEST_CS DEST_UID NAME dest="" f
+    MODE=$(sed -n 's/^MODE=//p' "$q/meta"); DEST_CS=$(sed -n 's/^DEST_CS=//p' "$q/meta")
+    NAME=$(sed -n 's/^NAME=//p' "$q/meta")
+    [ "$MODE" = contact ] && dest=$(marti_dest "$DEST_CS")
+    : > "$RUN/out.cot"
+    cot_presence | fill_cot "" >> "$RUN/out.cot"; echo >> "$RUN/out.cot"
+    for f in survey.cot hosts.cot chat.cot; do
+        [ -s "$q/$f" ] && { fill_cot "$dest" < "$q/$f" >> "$RUN/out.cot"; echo >> "$RUN/out.cot"; }
+    done
+    if [ -s "$q/package.zip" ] && [ "$C_PROTO" != udp ]; then
+        CREATE_SPINNER "Uploading package"
+        upload_package "$q/package.zip" "$NAME"; local urc=$?
+        STOP_SPINNER
+        [ $urc -eq 0 ] || return 1
+        [ "$MODE" != upload ] && { cot_fileshare "$NAME" "$PKG_URL" "$PKG_SIZE" "$PKG_HASH" | fill_cot "$dest" >> "$RUN/out.cot"; echo >> "$RUN/out.cot"; }
+    fi
+    step "sending to TAK"
+    CREATE_SPINNER "Sending to TAK"
+    tak_session "$RUN/out.cot" 3; local rc=$?
+    STOP_SPINNER
+    [ $rc -eq 0 ] || { step idle; return 1; }
+    mkdir -p "$SENT_DIR"; mv "$q" "$SENT_DIR/" 2>/dev/null
+    step idle
+    return 0
+}
+
+flush_queue() {  # flush_queue [quiet]
+    local q n=0 ok=0
+    [ -d "$QUEUE_DIR" ] || { [ "$1" = quiet ] || note "Queue is empty"; return 0; }
+    for q in "$QUEUE_DIR"/*/; do [ -f "$q/meta" ] && n=$((n + 1)); done
+    [ "$n" -gt 0 ] || { [ "$1" = quiet ] || note "Queue is empty"; return 0; }
+    ensure_net || return 1
+    tak_ready || { LED FAIL; info "$LAST_ERR"; return 1; }
+    LED STAGE2
+    for q in "$QUEUE_DIR"/*/; do
+        [ -f "$q/meta" ] || continue
+        if send_item "${q%/}"; then ok=$((ok + 1)); else break; fi
+    done
+    if [ "$ok" -eq "$n" ]; then LED FINISH; note "Sent $ok of $n"; return 0; fi
+    LED FAIL; info "Sent $ok of $n\n${LAST_ERR:-TAK not reachable}\nRest stays queued"
+    return 1
+}
+queue_count() { local n=0 q; for q in "$QUEUE_DIR"/*/; do [ -f "$q/meta" ] && n=$((n + 1)); done; echo "$n"; }
+
+# ---------------------------------------------------------------------------
+# Send menu (after a survey, or from TAK > Send last survey)
+# ---------------------------------------------------------------------------
+SEND_PENDING=0
+deliver() {  # deliver mode [cs uid]
+    LAST_ERR=""
+    resolve_location
+    LAST_ERR=""
+    queue_survey "$@"
+    S_DONE=1
+    local q="$QUEUE_DIR/$S_TS-${S_ID:0:8}"
+    if tak_ready && [ "$C_PROTO" != udp ] && ! tcp_probe "$C_HOST" "$C_PORT"; then
+        LAST_ERR="$C_HOST:$C_PORT no answer"
+    fi
+    if [ -z "$LAST_ERR" ] && send_item "$q"; then
+        LED FINISH; note "Sent to TAK${2:+\n$2}"
+        [ "$(queue_count)" -gt 0 ] && flush_queue quiet
+    else
+        LED CLEANUP; info "Queued for later\n${LAST_ERR:-TAK not reachable}\nTAK > Send queue"
+    fi
+    LAST_ERR=""
+}
+
+send_survey_menu() {
+    [ -n "$S_DIR" ] && [ -s "$S_DIR/summary.txt" ] || { info "No survey yet - run one first"; return; }
+    [ "${S_DONE:-0}" = 1 ] && { local r; r=$(CONFIRMATION_DIALOG "Already sent/queued. Send again?" "Send"); [ "$r" = Send ] || return; }
+    local r
+    r=$(LIST_PICKER "Send survey" "Contact Everyone UploadOnly QueueOnly" "Contact")
+    cancelled "$r" && return
+    case "$r" in
+        Contact)    pick_contact ;;
+        Everyone)   deliver all ;;
+        UploadOnly) deliver upload ;;
+        QueueOnly)  resolve_location; queue_survey all; S_DONE=1; LED CLEANUP; note "Queued" ;;
+    esac
+}
+
+pick_contact() {
+    note "Getting TAK contacts"
+    tak_listen
+    CLEAR_MENU "contacts"
+    local n=0 cs uid
+    while IFS='|' read -r cs uid _; do
+        [ -n "$cs" ] || continue
+        ADD_SUBMENU_ITEM "contacts" "$cs" "contact_chosen" "$uid|$cs"
+        n=$((n + 1)); [ "$n" -ge 40 ] && break
+    done < <(sort -t'|' -k1,1 -f "$CONTACTS_FILE" 2>/dev/null)
+    if [ "$n" -eq 0 ]; then info "No TAK contacts seen.\n${LAST_ERR:-Is anyone online?}"; return; fi
+    ADD_SUBMENU_ITEM "contacts" "$BACK" "" ""
+    SELECT_MENU "contacts"
+}
+contact_chosen() {
+    local uid=${SELECTED_ITEM_DATA%%|*} cs=${SELECTED_ITEM_DATA#*|}
+    deliver contact "$cs" "$uid"
+    SELECT_MENU main_menu
+}
+
+# ---------------------------------------------------------------------------
+# Menu actions
+# ---------------------------------------------------------------------------
+after_scan() {
+    local r
+    r=$(OPTION_DIALOG "Scan done. Send to TAK?" "Send" "Later")
+    [ "$r" = "Send" ] && send_survey_menu
+}
+
+run_full_survey() {
+    new_survey
+    LED ATTACK
+    scan_fingerprint || return
+    scan_hosts || return
+    local key; key=$(baseline_key)
+    if [ -s "$BASELINE_DIR/$key.txt" ]; then baseline_diff; else LOG "No baseline for this network yet"; fi
+    [ "$C_SURVEY_PCAP" = 1 ] && scan_pcap
+    LED FINISH
+    show_summary nobrowse
+    if [ ! -s "$BASELINE_DIR/$key.txt" ]; then
+        local r; r=$(CONFIRMATION_DIALOG "Save this scan as the baseline for this network?" "Save")
+        [ "$r" = "Save" ] && baseline_save
+    fi
+    send_survey_menu
+}
+do_fingerprint() { new_survey; scan_fingerprint && { show_summary nobrowse; after_scan; }; }
+do_hosts()       { new_survey; scan_hosts && { show_summary nobrowse; after_scan; }; }
+do_diff()        { ensure_survey; baseline_diff; after_scan; }
+do_pcap()        { ensure_survey; scan_pcap && after_scan; }
+do_baseline_save() { ensure_survey; [ -s "$S_DIR/hosts.tsv" ] || scan_hosts || return; baseline_save; }
+do_baseline_clear() {
+    local key r; key=$(baseline_key)
+    [ -f "$BASELINE_DIR/$key.txt" ] || { note "No baseline here"; return; }
+    r=$(CONFIRMATION_DIALOG "Delete this network's baseline?" "Delete")
+    [ "$r" = Delete ] && rm -f "$BASELINE_DIR/$key.txt" && note "Baseline deleted"
+}
+
+show_summary() {
+    [ -n "$S_DIR" ] && [ -s "$S_DIR/summary.txt" ] || { note "No results yet"; return; }
+    local hosts=0 r
+    [ -s "$S_DIR/hosts.tsv" ] && hosts=$(wc -l < "$S_DIR/hosts.tsv")
+    info "IP ${N_IP:-?}/${N_PREFIX:-?}\nGW ${N_GW:-?}\nHosts: ${hosts// /}\nDHCP srv: ${F_DHCP:-?}\nSw: ${F_SWITCH:-?} ${F_PORT}\nVLAN ${F_VLAN:-?}\n${F_INET:-}"
+    [ "$hosts" -gt 0 ] && [ "$1" != nobrowse ] || return 0
+    r=$(OPTION_DIALOG "Browse hosts?" "Hosts" "Done")
+    [ "$r" = Hosts ] && browse_hosts
+}
+browse_hosts() {
+    CLEAR_MENU "hostlist"
+    local ip mac vendor name ports n=0
+    while IFS=$'\t' read -r ip mac vendor name ports; do
+        ADD_SUBMENU_ITEM "hostlist" "$ip" "host_detail" "$ip|$mac|$vendor|$name|$ports"
+        n=$((n + 1)); [ "$n" -ge 120 ] && break
+    done < "$S_DIR/hosts.tsv"
+    ADD_SUBMENU_ITEM "hostlist" "$BACK" "" ""
+    SELECT_MENU "hostlist"
+}
+host_detail() {
+    local ip mac vendor name ports
+    IFS='|' read -r ip mac vendor name ports <<< "$SELECTED_ITEM_DATA"
+    info "$ip\n${name:-no name}\n${mac:-no MAC}\n${vendor:-}\n${ports//,/ }"
+}
+
+# ---- location menu
+loc_show() {
+    CREATE_SPINNER "Locating"
+    locate; local rc=$?
+    STOP_SPINNER
+    if [ $rc -eq 0 ]; then info "$P_LAT\n$P_LON\nCE ${P_CE} m\n$P_SRC"; else info "No location\nMode: $C_LOC_MODE"; fi
+}
+loc_mode() {
+    local r; r=$(LIST_PICKER "Location mode" "auto atak site manual ip" "$C_LOC_MODE")
+    cancelled "$r" && return; cfg_set LOC_MODE "$r"; C_LOC_MODE=$r; note "Location: $r"
+}
+loc_anchor_now() {
+    [ -n "$C_MY_ATAK" ] || set_my_atak || return
+    CREATE_SPINNER "Asking TAK for $C_MY_ATAK"
+    atak_anchor; local rc=$?
+    STOP_SPINNER
+    if [ $rc -eq 0 ]; then
+        printf '%s %s %s\n' "$P_LAT" "$P_LON" "$P_CE" > "$BASE_DIR/last_pos"
+        info "$P_LAT\n$P_LON\n$P_SRC"
+    else
+        info "No position for\n$C_MY_ATAK\n${LAST_ERR:-online + reporting?}"
+    fi
+}
+loc_pick_site() {
+    CLEAR_MENU "sites"
+    local name lat lon n=0
+    while IFS='|' read -r name lat lon; do
+        [ -n "$name" ] || continue
+        ADD_SUBMENU_ITEM "sites" "$name" "site_chosen" "$name"; n=$((n + 1))
+    done < "$SITES_FILE"
+    ADD_SUBMENU_ITEM "sites" "Save current" "site_save" ""
+    ADD_SUBMENU_ITEM "sites" "$BACK" "" ""
+    SELECT_MENU "sites"
+}
+site_chosen() {
+    cfg_set SITE "$SELECTED_ITEM_DATA"; C_SITE=$SELECTED_ITEM_DATA
+    cfg_set LOC_MODE site; C_LOC_MODE=site
+    note "Site: $C_SITE"; SELECT_MENU main_menu
+}
+site_save() {
+    locate || { info "No current location to save"; return; }
+    local n; n=$(TEXT_PICKER "Site name" "site01" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    cancelled "$n" && return
+    n=${n// /}
+    { grep -v "^$n|" "$SITES_FILE" 2>/dev/null; printf '%s|%s|%s\n' "$n" "$P_LAT" "$P_LON"; } > "$RUN/sites" && mv "$RUN/sites" "$SITES_FILE"
+    cfg_set SITE "$n"; C_SITE=$n; note "Saved site $n"; SELECT_MENU main_menu
+}
+set_manual() {  # fixed-width pickers: the first slot is a space or "-"
+    local a o
+    a=$(TEXT_PICKER "Latitude" "$(printf '%10s' "${C_MAN_LAT:-00.000000}")" " -0123456789."); cancelled "$a" && return 1
+    o=$(TEXT_PICKER "Longitude" "$(printf '%11s' "${C_MAN_LON:-000.000000}")" " -0123456789."); cancelled "$o" && return 1
+    a=${a// /}; o=${o// /}
+    valid_coord "$a" "$o" || { info "Not a valid lat/lon:\n$a\n$o"; return 1; }
+    cfg_set MANUAL_LAT "$a"; cfg_set MANUAL_LON "$o"; C_MAN_LAT=$a; C_MAN_LON=$o
+    note "Manual position set"; return 0
+}
+loc_manual() { set_manual && { cfg_set LOC_MODE manual; C_LOC_MODE=manual; }; }
+
+# ---- settings
+set_server_ip() {
+    local r; r=$(IP_PICKER "TAK server IP" "192.168.1.10"); cancelled "$r" && return
+    cfg_set TAK_HOST "$r"; C_HOST=$r; note "Server $r"
+}
+set_server_name() {  # up to 16 characters on the device; longer names go in default.cfg
+    local r; r=$(TEXT_PICKER "TAK server name" "$(printf '%-16.16s' "${C_HOST/takserver.example.com/}")" "abcdefghijklmnopqrstuvwxyz0123456789.- ")
+    cancelled "$r" && return
+    r=${r// /}; [ -n "$r" ] || return
+    cfg_set TAK_HOST "$r"; C_HOST=$r; note "Server $r"
+}
+set_proto() {
+    local r; r=$(LIST_PICKER "TAK protocol" "tls tcp udp" "$C_PROTO"); cancelled "$r" && return
+    cfg_set TAK_PROTO "$r"; C_PROTO=$r
+    case "$r" in tls) cfg_set TAK_PORT 8089; cfg_set API_PORT 8443 ;; *) cfg_set TAK_PORT 8087; cfg_set API_PORT 8080 ;; esac
+    load_config; note "$r port $C_PORT"
+}
+set_port() {
+    local r; r=$(SINGLE_NUMBER_PICKER "CoT port" "$C_PORT"); cancelled "$r" && return
+    r=$(num "$r") && { cfg_set TAK_PORT "$r"; C_PORT=$r; }
+    r=$(SINGLE_NUMBER_PICKER "API port (packages)" "$C_API_PORT"); cancelled "$r" && return
+    r=$(num "$r") && { cfg_set API_PORT "$r"; C_API_PORT=$r; }
+}
+set_callsign() {
+    local r; r=$(TEXT_PICKER "Callsign" "$C_CALLSIGN" "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"); cancelled "$r" && return
+    r=${r// /}; [ -n "$r" ] && { cfg_set CALLSIGN "$r"; C_CALLSIGN=$r; }
+}
+set_my_atak() {
+    local r; r=$(TEXT_PICKER "My ATAK callsign" "${C_MY_ATAK:-}" "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_. ")
+    cancelled "$r" && return 1
+    r=$(sed 's/^ *//; s/ *$//' <<< "$r"); [ -n "$r" ] || return 1
+    cfg_set MY_ATAK "$r"; C_MY_ATAK=$r; note "Anchor: $r"; return 0
+}
+set_ports() {
+    local r; r=$(LIST_PICKER "Top ports" "20 100 300 1000" "$C_TOP"); cancelled "$r" && return
+    cfg_set TOP_PORTS "$r"; C_TOP=$r
+}
+set_scope() {
+    local r; r=$(LIST_PICKER "Max subnet swept" "24 23 22 20 full" "$C_SCOPE"); cancelled "$r" && return
+    cfg_set SCAN_SCOPE "$r"; C_SCOPE=$r
+}
+set_pcap_seconds() {
+    local r; r=$(SINGLE_NUMBER_PICKER "Capture seconds" "$C_PCAP_S" "10"); cancelled "$r" && return
+    r=$(num "$r") && [ "$r" -gt 0 ] && { cfg_set PCAP_SECONDS "$r"; C_PCAP_S=$r; }
+}
+set_netmode_opt() {
+    local r; r=$(LIST_PICKER "Survey NETMODE" "DHCP_CLIENT STATIC" "$C_NETMODE"); cancelled "$r" && return
+    cfg_set SURVEY_NETMODE "$r"; C_NETMODE=$r; NET_READY=0
+}
+toggle() {  # toggle KEY VAR label
+    local cur=${!2} new; [ "$cur" = 1 ] && new=0 || new=1
+    cfg_set "$1" "$new"; printf -v "$2" '%s' "$new"; note "$3: $(onoff "$new")"
+}
+t_sv()      { toggle SERVICE_VERSIONS C_SV "Service versions"; }
+t_nse() {
+    if ! nmap_nse; then info "Safe NSE needs\nnmap-full.\nSettings > Install\nPackages"; return; fi
+    toggle NSE C_NSE "Safe scripts"
+}
+t_snmp()    { toggle SNMP C_SNMP "SNMP location"; [ "$C_SNMP" = 1 ] && need_pkg snmpget snmp-utils "SNMP location"; }
+t_ipgeo()   { toggle IPGEO C_IPGEO "IP geolocation"; }
+t_hm()      { toggle HOST_MARKERS C_HOST_MARKERS "Host markers"; }
+t_spcap()   { toggle SURVEY_PCAP C_SURVEY_PCAP "Capture in survey"; }
+t_chat()    { toggle CHAT_ALERT C_CHAT_ALERT "Chat on alert"; }
+show_settings() {
+    info "$C_HOST\n$C_PROTO $C_PORT / API $C_API_PORT\n$C_CALLSIGN  Loc $C_LOC_MODE\nAnchor ${C_MY_ATAK:-none}\nTop $C_TOP  /$C_SCOPE\nNSE $(onoff "$C_NSE") HostMk $(onoff "$C_HOST_MARKERS")"
+}
+test_link() {
+    ensure_net || return
+    tak_ready || { info "$LAST_ERR"; return; }
+    CREATE_SPINNER "Testing $C_PROTO"
+    tak_session_test; local rc=$?
+    STOP_SPINNER
+    local n=0; [ -s "$CONTACTS_FILE" ] && n=$(wc -l < "$CONTACTS_FILE")
+    if [ $rc -eq 0 ]; then LED FINISH; info "TAK OK\n$C_HOST:$C_PORT\nContacts: ${n// /}"; else LED FAIL; info "TAK failed\n${LAST_ERR:-see $LOGS/ssl.log}"; fi
+}
+tak_session_test() { cot_presence | fill_cot "" > "$RUN/presence.cot"; echo >> "$RUN/presence.cot"; tak_session "$RUN/presence.cot" "$C_LISTEN"; }
+show_ssh() {
+    local ip st
+    ip=$(ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    START_SSH >/dev/null 2>&1
+    st=$(SSH_STATUS 2>/dev/null | head -1)
+    info "SSH ${st:-started}\nroot@${ip:-no IP yet}\n(run a scan first if\nno IP)"
+}
+show_queue() {
+    local n; n=$(queue_count)
+    local r; r=$(OPTION_DIALOG "Queue: $n waiting" "Send" "Back")
+    [ "$r" = Send ] && flush_queue
+}
+
+# ---------------------------------------------------------------------------
+# Certificates: PEM, .p12 conversion, or enrollment with a TAK username
+# ---------------------------------------------------------------------------
+convert_p12() {  # convert_p12 in.p12 out.pem password [nokeys]
+    local extra=(-nodes); [ "$4" = nokeys ] && extra=(-nokeys)
+    openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2> "$LOGS/p12.log" && return 0
+    openssl pkcs12 -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$LOGS/p12.log" && return 0
+    # TAK .p12 files use old encryption: OpenSSL 3 needs its legacy module (libopenssl-legacy)
+    if grep -qiE 'legacy|unsupported|RC2' "$LOGS/p12.log" && ! opkg list-installed 2>/dev/null | grep -q '^libopenssl-legacy '; then
+        need_pkg_quiet libopenssl-legacy && openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$LOGS/p12.log" && return 0
+    fi
+    return 1
+}
+p12_bad_password() { grep -qi 'mac verify\|invalid password' "$LOGS/p12.log"; }
+setup_certs() {
+    mkdir -p "$CERT_DIR"; chmod 700 "$CERT_DIR"
+    local client="$CERT_DIR/$CLIENT_PEM" ca="$CERT_DIR/$CA_PEM" p12s=() pw sel
+    if [ -s "$client" ] && grep -q "PRIVATE KEY" "$client"; then
+        if grep -q "ENCRYPTED PRIVATE KEY\|Proc-Type: 4,ENCRYPTED" "$client"; then
+            info "client.pem key has a password.\nRe-export with -nodes."; return 1
+        fi
+        return 0
+    fi
+    if ls "$CERT_DIR"/*.zip >/dev/null 2>&1; then
+        import_package
+        return $?
+    fi
+    mapfile -t p12s < <(cd "$CERT_DIR" && ls ./*.p12 2>/dev/null | sed 's#^\./##')
+    if [ ${#p12s[@]} -eq 0 ]; then
+        local r; r=$(OPTION_DIALOG "No TAK cert. Enroll with TAK user?" "Enroll" "Cancel")
+        [ "$r" = Enroll ] && tak_enroll && return 0
+        info "No TAK cert. Copy the\nconnection .zip or\n.p12 files to\n/root/\nsharktakdisplay/certs/"
+        return 1
+    fi
+    sel=${p12s[0]}
+    if [ ${#p12s[@]} -gt 1 ]; then
+        sel=$(LIST_PICKER "Client .p12" "${p12s[*]}" "${p12s[0]}"); cancelled "$sel" && return 1
+    fi
+    pw=$(TEXT_PICKER "p12 password" "atakatak"); cancelled "$pw" && return 1
+    pw=$(sed 's/ *$//' <<< "$pw")
+    convert_p12 "$CERT_DIR/$sel" "$client" "$pw" && grep -q "PRIVATE KEY" "$client" \
+        || { rm -f "$client"; info "Could not convert $sel\n(password? truststore?)"; return 1; }
+    chmod 600 "$client"
+    local other
+    for other in "${p12s[@]}"; do
+        [ "$other" = "$sel" ] && continue
+        convert_p12 "$CERT_DIR/$other" "$ca" "$pw" nokeys && grep -q CERTIFICATE "$ca" && { LOG "CA from $other"; break; }
+        rm -f "$ca"
+    done
+    [ -s "$ca" ] || LOG "No ca.pem - server cert not verified"
+    note "Certificate ready"; return 0
+}
+cert_from_menu() {
+    command -v openssl >/dev/null 2>&1 || need_pkg openssl openssl-util "TAK certificates" || return
+    setup_certs && note "Cert OK"
+}
+
+pem_wrap() { printf '%s\n' "-----BEGIN CERTIFICATE-----"; printf '%s' "$1" | tr -d '\\n ' | awk '{ for (i = 1; i <= length($0); i += 64) print substr($0, i, 64) }'; printf '%s\n' "-----END CERTIFICATE-----"; }
+json_get() { tr -d '\n' < "$1" | sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p"; }
+
+tak_enroll() {
+    ensure_net || return 1
+    need_pkg openssl openssl-util "Enrollment" || return 1
+    [ "$C_HOST" != "takserver.example.com" ] || { info "Set the TAK server first"; return 1; }
+    local user pass dir="$RUN/enroll" code subj k v ca=() tls=() cu cpw
+    user=$(TEXT_PICKER "TAK username" "                "); cancelled "$user" && return 1
+    pass=$(TEXT_PICKER "TAK password" "                "); cancelled "$pass" && return 1
+    user=$(sed 's/^ *//; s/ *$//' <<< "$user"); pass=$(sed 's/^ *//; s/ *$//' <<< "$pass")
+    [ -n "$user" ] && [ -n "$pass" ] || return 1
+    rm -rf "$dir"; mkdir -p "$dir"; chmod 700 "$dir"
+    [ -s "$CERT_DIR/$CA_PEM" ] && tls=(--cacert "$CERT_DIR/$CA_PEM")   # else the public CA list - never unchecked, the password goes with it
+    cu=${user//\\/\\\\}; cpw=${pass//\\/\\\\}; cu=${cu//\"/\\\"}; cpw=${cpw//\"/\\\"}
+    ( umask 077; printf 'user = "%s:%s"\n' "$cu" "$cpw" > "$dir/auth" )      # keeps the password off the command line
+    local rc
+    enroll_config() {
+        code=$(curl -sS "${tls[@]}" --connect-timeout 15 --max-time 30 -K "$dir/auth" -o "$dir/config.xml" -w '%{http_code}' \
+            "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/config" 2>> "$LOGS/enroll.log"); rc=$?
+    }
+    CREATE_SPINNER "Enrolling"
+    enroll_config
+    case "$rc" in 35|51|58|60|77|83)
+        # 8446 may carry a public certificate (Let's Encrypt...): try the public CA list
+        [ "${tls[0]}" = --cacert ] && { tls=(); enroll_config; } ;;
+    esac
+    case "$rc" in 35|51|58|60|77|83)
+        STOP_SPINNER
+        local r; r=$(CONFIRMATION_DIALOG "Cannot verify the server's certificate. Copy ca.pem first, or enroll unverified?" "Unverified")
+        [ "$r" = "Unverified" ] || { rm -rf "$dir"; return 1; }
+        tls=(-k); CREATE_SPINNER "Enrolling"; enroll_config ;;
+    esac
+    if [ "$code" != 200 ]; then STOP_SPINNER; rm -rf "$dir"; info "Enroll failed\nHTTP ${code:-none} curl $rc\n$C_HOST:$C_ENROLL_PORT"; return 1; fi
+    subj="/CN=${user//\//_}"
+    while IFS='|' read -r k v; do
+        case "$k" in C|ST|L|O|OU) subj+="/$k=${v//\//_}" ;; esac
+    done < <(grep -o '<[A-Za-z0-9:]*nameEntry [^>]*>' "$dir/config.xml" | while read -r e; do
+                 printf '%s|%s\n' "$(sed -n 's/.* name="\([^"]*\)".*/\1/p' <<< "$e")" "$(sed -n 's/.* value="\([^"]*\)".*/\1/p' <<< "$e")"
+             done)
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$dir/key.pem" -subj "$subj" -out "$dir/csr.pem" >> "$LOGS/enroll.log" 2>&1 \
+        || { STOP_SPINNER; rm -rf "$dir"; info "Key generation failed"; return 1; }
+    grep -v -- "-----" "$dir/csr.pem" > "$dir/csr.b64"
+    code=$(curl -sS "${tls[@]}" --connect-timeout 15 --max-time 60 -K "$dir/auth" -o "$dir/signed.json" -w '%{http_code}' \
+        -H "Content-Type: application/pkcs10" -H "Accept: application/json" --data-binary "@$dir/csr.b64" \
+        "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/signClient/v2?clientUid=$C_UID&version=$PRODUCT_NAME-$PAYLOAD_VERSION" 2>> "$LOGS/enroll.log")
+    rm -f "$dir/auth"
+    STOP_SPINNER
+    [ "$code" = 200 ] || { rm -rf "$dir"; info "Signing failed\nHTTP ${code:-none}"; return 1; }
+    v=$(json_get "$dir/signed.json" signedCert)
+    [ -n "$v" ] || { rm -rf "$dir"; info "No certificate returned"; return 1; }
+    mkdir -p "$CERT_DIR"
+    { cat "$dir/key.pem"; pem_wrap "$v"; } > "$dir/client.pem"
+    for k in ca0 ca1 ca2 ca3; do v=$(json_get "$dir/signed.json" "$k"); [ -n "$v" ] && ca+=("$(pem_wrap "$v")"); done
+    ( umask 077; cp "$dir/client.pem" "$CERT_DIR/$CLIENT_PEM" )
+    [ ${#ca[@]} -gt 0 ] && printf '%s\n' "${ca[@]}" > "$CERT_DIR/$CA_PEM"
+    rm -rf "$dir"
+    cfg_set TAK_PROTO tls; C_PROTO=tls
+    note "Enrolled as $user"
+    return 0
+}
+
+
+# ---------------------------------------------------------------------------
+# Setup: staged folders, connection package import, checklist, packages
+# ---------------------------------------------------------------------------
+# First run: move SharkTAK-era data, stage certs/ with a README, and a default.cfg with every main key
+stage_files() {
+    if [ -d /root/sharktak ] && [ ! -e "$BASE_DIR" ]; then
+        mkdir -p "${BASE_DIR%/*}" && mv /root/sharktak "$BASE_DIR" && MIGRATED=1
+    fi
+    if [ -d /root/loot/sharktak ] && [ ! -e "$LOOT_BASE" ]; then
+        mkdir -p "${LOOT_BASE%/*}" && mv /root/loot/sharktak "$LOOT_BASE"
+    fi
+    mkdir -p "$RUN" "$BASE_DIR" "$CERT_DIR" "$QUEUE_DIR" "$BASELINE_DIR" "$LOOT_BASE" "$LOGS"
+    chmod 700 "$BASE_DIR" "$CERT_DIR"
+    touch "$SITES_FILE"
+    [ -f "$CERT_DIR/README.txt" ] || cat > "$CERT_DIR/README.txt" <<'EOF'
+SharkTAKDisplay - put your TAK certificates here
+
+Use ONE of these:
+  1. Your TAK Server connection package (.zip). SharkTAKDisplay reads the server,
+     port and both certificates from it, then renames it to .imported.
+  2. client.pem (certificate + unencrypted key) and ca.pem (TAK CA)
+  3. Your .p12 files (client + truststore). You enter the password on the device.
+Or no files at all: Settings > TAK Server > Enroll, with your TAK username and password.
+
+Copy from a PC (the jack's IP is under About > Networking):
+  scp yourpackage.zip root@JACK-IP:/root/sharktakdisplay/certs/
+
+Copy the files themselves into this folder, not a folder that holds them.
+Then on the jack: Settings > Setup Check.
+EOF
+    # default.cfg: only ever created once, when it truly does not exist
+    find_cfg_file || return 0
+    if [ ! -f "$CFG_FILE" ]; then
+        local old
+        old=$(find /root/library /root/payloads -maxdepth 6 -type f -path '*/SharkTAK/default.cfg' 2>/dev/null | head -1)
+        if [ -n "$old" ]; then
+            cp "$old" "$CFG_FILE" && MIGRATED=1          # settings from the old SharkTAK payload
+        else
+            printf '%s\n' "TAK_HOST: $D_TAK_HOST" "TAK_PROTO: $D_TAK_PROTO" "TAK_PORT: $D_TAK_PORT" \
+                "API_PORT: $D_API_PORT" "ENROLL_PORT: $D_ENROLL_PORT" "CALLSIGN: $D_CALLSIGN" \
+                "TEAM: $D_TEAM" "ROLE: $D_ROLE" "MY_ATAK: $D_MY_ATAK" "LOC_MODE: $D_LOC_MODE" > "$CFG_FILE"
+        fi
+    fi
+    repair_cfg
+}
+
+# ATAK connection package (.zip): config.pref names the server and the certificate files + passwords
+# shellcheck disable=SC2120   # the zip path is optional (defaults to the first .zip in certs/)
+import_package() {  # import_package [zip]
+    local zip=$1 d="$RUN/connpkg" pref cs host port proto cl cap clp cpw got=0
+    [ -n "$zip" ] || zip=$(ls "$CERT_DIR"/*.zip 2>/dev/null | head -1)
+    [ -s "$zip" ] || { info "No .zip in\n/root/\nsharktakdisplay/certs/"; return 1; }
+    command -v openssl >/dev/null 2>&1 || need_pkg openssl openssl-util "Certificates" || return 1
+    command -v unzip >/dev/null 2>&1 || need_pkg unzip unzip "Connection packages" || return 1
+    rm -rf "${d:?}"; mkdir -p "$d"; chmod 700 "$d"
+    CREATE_SPINNER "Importing package"
+    unzip -o -q "$zip" -d "$d" > "$LOGS/import.log" 2>&1
+    pref=$(find "$d" -type f -iname '*.pref' | head -1)
+    STOP_SPINNER
+    if [ -z "$pref" ]; then
+        rm -rf "${d:?}"; info "No config.pref in\n${zip##*/}\nNot a TAK connection\npackage?"; return 1
+    fi
+    pref_get() { tr -d '\r\n' < "$pref" | grep -o "<entry key=\"$1\"[^>]*>[^<]*</entry>" | head -1 | sed 's/.*>\([^<]*\)<\/entry>/\1/'; }
+    cs=$(xml_unesc "$(pref_get connectString0)")              # host:port:ssl
+    host=${cs%%:*}; port=$(cut -d: -f2 <<< "$cs"); proto=$(cut -d: -f3 <<< "$cs")
+    cl=$(pref_get certificateLocation); cap=$(pref_get caLocation)
+    clp=$(xml_unesc "$(pref_get clientPassword)"); cpw=$(xml_unesc "$(pref_get caPassword)")
+    [ -n "$clp" ] || clp=atakatak; [ -n "$cpw" ] || cpw=$clp
+    pkg_file() { [ -n "$1" ] && find "$d" -type f -name "${1##*/}" | head -1; }
+    cl=$(pkg_file "$cl"); cap=$(pkg_file "$cap")
+    [ -n "$cap" ] || cap=$(find "$d" -type f -iname '*.p12' | grep -i trust | head -1)
+    # server settings
+    if [ -n "$host" ]; then
+        cfg_set TAK_HOST "$host"
+        [[ $port =~ ^[0-9]+$ ]] && cfg_set TAK_PORT "$port"
+        case "$proto" in
+            ssl|tls|"") cfg_set TAK_PROTO tls; cfg_set API_PORT 8443 ;;
+            tcp)        cfg_set TAK_PROTO tcp; cfg_set API_PORT 8080 ;;
+        esac
+    fi
+    # truststore -> ca.pem
+    if [ -n "$cap" ]; then
+        if ! { convert_p12 "$cap" "$CERT_DIR/$CA_PEM" "$cpw" nokeys && grep -q CERTIFICATE "$CERT_DIR/$CA_PEM"; }; then
+            rm -f "${CERT_DIR:?}/${CA_PEM:?}"; LOG "Truststore not converted"
+        fi
+    fi
+    # client cert -> client.pem (enrollment packages carry none)
+    if [ -n "$cl" ]; then
+        if convert_p12 "$cl" "$CERT_DIR/$CLIENT_PEM" "$clp" && grep -q "PRIVATE KEY" "$CERT_DIR/$CLIENT_PEM"; then
+            got=1
+        elif p12_bad_password; then
+            local pw; pw=$(TEXT_PICKER "Client .p12 password" "atakatak        "); pw=$(sed 's/ *$//' <<< "$pw")
+            if ! cancelled "$pw" && convert_p12 "$cl" "$CERT_DIR/$CLIENT_PEM" "$pw" && grep -q "PRIVATE KEY" "$CERT_DIR/$CLIENT_PEM"; then got=1; fi
+        fi
+        [ "$got" = 1 ] || rm -f "${CERT_DIR:?}/${CLIENT_PEM:?}"
+    fi
+    rm -rf "${d:?}"
+    load_config
+    if [ "$got" = 1 ]; then
+        chmod 600 "$CERT_DIR/$CLIENT_PEM"
+        mv "$zip" "$zip.imported"
+        note "Imported\n${host:-package}"
+        return 0
+    fi
+    if [ -z "$cl" ]; then
+        mv "$zip" "$zip.imported"
+        local r; r=$(OPTION_DIALOG "Package has no client cert. Enroll now?" "Enroll" "Later")
+        [ "$r" = Enroll ] && tak_enroll && return 0
+        return 1
+    fi
+    info "Client cert not\nconverted.\nWrong password?\nSee $LOGS/p12.log"
+    return 1
+}
+import_from_menu() { import_package && note "Ready - Test Link"; }
+
+# Checklist: packages, then TAK
+setup_check() {
+    local ok="OK" no="--" p1 p2 c ca h r
+    pk() { command -v "$1" >/dev/null 2>&1 && echo "$ok" || echo "$no"; }
+    p1="Packages\nopenssl   $(pk openssl)\nunzip     $(pk unzip)\ntcpdump   $(pk tcpdump)\nsnmpget   $(pk snmpget)\nNSE       $(nmap_nse && echo "$ok" || echo "$no")"
+    info "$p1"
+    c=$no; [ -s "$CERT_DIR/$CLIENT_PEM" ] && grep -q "PRIVATE KEY" "$CERT_DIR/$CLIENT_PEM" && c=$ok
+    ca=$no; [ -s "$CERT_DIR/$CA_PEM" ] && ca=$ok
+    h=$no; [ -n "$C_HOST" ] && [ "$C_HOST" != "takserver.example.com" ] && h=$ok
+    if [ "$C_PROTO" = tls ]; then
+        p2="TAK\nServer    $h\nCert      $c\nCA        $ca\nCallsign  $C_CALLSIGN\nAnchor    ${C_MY_ATAK:-none}"
+    else
+        p2="TAK\nServer    $h\nProtocol  $C_PROTO\nCallsign  $C_CALLSIGN\nAnchor    ${C_MY_ATAK:-none}"
+    fi
+    info "$p2"
+    if ! command -v openssl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+        r=$(CONFIRMATION_DIALOG "Install the missing packages now? (internet)" "Install")
+        [ "$r" = Install ] && install_packages
+    fi
+    if [ "$c" = "$no" ] && [ "$C_PROTO" = tls ]; then
+        if ls "$CERT_DIR"/*.zip >/dev/null 2>&1; then
+            import_package
+        else
+            info "No TAK cert. Copy the\nconnection .zip to\n/root/\nsharktakdisplay/certs/\nor use Enroll"
+        fi
+    fi
+    load_config
+    if [ -z "$C_HOST" ] || [ "$C_HOST" = "takserver.example.com" ]; then
+        info "Set the server:\nTAK Server > Server\nor default.cfg"; return
+    fi
+    r=$(CONFIRMATION_DIALOG "Test the TAK link now?" "Test")
+    [ "$r" = Test ] && test_link
+}
+
+# One press: everything SharkTAKDisplay can use
+install_packages() {
+    local pkgs="openssl-util libopenssl-legacy unzip tcpdump snmp-utils" p n=0 i=0 failed=""   # zip: built in (mkzip_sh)
+    ensure_net || return 1
+    CREATE_SPINNER "opkg update"
+    opkg update > "$LOGS/opkg.log" 2>&1     # the firmware's hak5 feed always errors - ignored
+    STOP_SPINNER
+    for p in $pkgs; do n=$((n + 1)); done
+    CREATE_PROGRESS_BAR "Installing"
+    for p in $pkgs; do
+        i=$((i + 1))
+        opkg install "$p" >> "$LOGS/opkg.log" 2>&1 || failed+=" $p"
+        SET_PROGRESS $(( i * 100 / n < 100 ? i * 100 / n : 99 ))
+    done
+    SET_PROGRESS 100
+    if [ -z "$failed" ]; then note "Packages installed"; else info "Not installed:\n${failed# }\nSee $LOGS/opkg.log"; fi
+    if ! nmap_nse; then
+        local r; r=$(CONFIRMATION_DIALOG "Also install nmap-full? Adds nmap scripts (DHCP, http-title, ssl-cert, SMB). Replaces basic nmap." "Install")
+        [ "$r" = Install ] && install_nmap_full
+    fi
+}
+install_nmap_full() {  # swap nmap -> nmap-full; put basic nmap back if that fails
+    CREATE_SPINNER "Installing nmap-full"
+    { opkg remove nmap && opkg install nmap-full; } >> "$LOGS/opkg.log" 2>&1
+    local rc=$?
+    if [ $rc -ne 0 ] || ! command -v nmap >/dev/null 2>&1; then
+        opkg install nmap >> "$LOGS/opkg.log" 2>&1
+        STOP_SPINNER; info "nmap-full failed,\nbasic nmap kept.\nSee $LOGS/opkg.log"; NSE_OK=""; return 1
+    fi
+    STOP_SPINNER; NSE_OK=""
+    if nmap_nse; then note "nmap-full installed"; else info "nmap installed but\nno script engine"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Menus
+# ---------------------------------------------------------------------------
+initialize_menu() {
+    ADD_MENU_ITEM "Full Survey" "run_full_survey"
+    ADD_MENU_ITEM "Scans" "menu_scans"
+    ADD_MENU_ITEM "Send to TAK" "menu_tak"
+    ADD_MENU_ITEM "Location" "menu_loc"
+    ADD_MENU_ITEM "Baseline" "menu_base"
+    ADD_MENU_ITEM "Results" "show_summary"
+    ADD_MENU_ITEM "Settings" "menu_settings"
+    ADD_MENU_ITEM "Quit" "EXIT_MENU"
+
+    ADD_SUBMENU_ITEM "menu_scans" "Fingerprint" "do_fingerprint"
+    ADD_SUBMENU_ITEM "menu_scans" "Hosts+Services" "do_hosts"
+    ADD_SUBMENU_ITEM "menu_scans" "Baseline Diff" "do_diff"
+    ADD_SUBMENU_ITEM "menu_scans" "Packet Capture" "do_pcap"
+    ADD_SUBMENU_ITEM "menu_scans" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_tak" "Send Survey" "send_survey_menu"
+    ADD_SUBMENU_ITEM "menu_tak" "Send Queue" "show_queue"
+    ADD_SUBMENU_ITEM "menu_tak" "Refresh Contacts" "refresh_contacts"
+    ADD_SUBMENU_ITEM "menu_tak" "Test Link" "test_link"
+    ADD_SUBMENU_ITEM "menu_tak" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_loc" "Show Location" "loc_show"
+    ADD_SUBMENU_ITEM "menu_loc" "Anchor to ATAK" "loc_anchor_now"
+    ADD_SUBMENU_ITEM "menu_loc" "Saved Sites" "loc_pick_site"
+    ADD_SUBMENU_ITEM "menu_loc" "Manual Lat/Lon" "loc_manual"
+    ADD_SUBMENU_ITEM "menu_loc" "Mode" "loc_mode"
+    ADD_SUBMENU_ITEM "menu_loc" "My ATAK Callsign" "set_my_atak"
+    ADD_SUBMENU_ITEM "menu_loc" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_base" "Compare Now" "do_diff"
+    ADD_SUBMENU_ITEM "menu_base" "Save Baseline" "do_baseline_save"
+    ADD_SUBMENU_ITEM "menu_base" "Delete Baseline" "do_baseline_clear"
+    ADD_SUBMENU_ITEM "menu_base" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_settings" "Setup Check" "setup_check"
+    ADD_SUBMENU_ITEM "menu_settings" "Install Packages" "install_packages"
+    ADD_SUBMENU_ITEM "menu_settings" "SSH / IP" "show_ssh"
+    ADD_SUBMENU_ITEM "menu_settings" "Show Settings" "show_settings"
+    ADD_SUBMENU_ITEM "menu_settings" "TAK Server" "menu_set_tak"
+    ADD_SUBMENU_ITEM "menu_settings" "Scan Options" "menu_set_scan"
+    ADD_SUBMENU_ITEM "menu_settings" "Output Options" "menu_set_out"
+    ADD_SUBMENU_ITEM "menu_settings" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_set_tak" "Server IP" "set_server_ip"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Server Name" "set_server_name"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Protocol" "set_proto"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Ports" "set_port"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Callsign" "set_callsign"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Import Package" "import_from_menu"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Certificate" "cert_from_menu"
+    ADD_SUBMENU_ITEM "menu_set_tak" "Enroll" "tak_enroll"
+    ADD_SUBMENU_ITEM "menu_set_tak" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_set_scan" "Top Ports" "set_ports"
+    ADD_SUBMENU_ITEM "menu_set_scan" "Max Subnet" "set_scope"
+    ADD_SUBMENU_ITEM "menu_set_scan" "Versions On/Off" "t_sv"
+    ADD_SUBMENU_ITEM "menu_set_scan" "Safe NSE On/Off" "t_nse"
+    ADD_SUBMENU_ITEM "menu_set_scan" "SNMP On/Off" "t_snmp"
+    ADD_SUBMENU_ITEM "menu_set_scan" "Capture Secs" "set_pcap_seconds"
+    ADD_SUBMENU_ITEM "menu_set_scan" "Capture in Survey" "t_spcap"
+    ADD_SUBMENU_ITEM "menu_set_scan" "NETMODE" "set_netmode_opt"
+    ADD_SUBMENU_ITEM "menu_set_scan" "$BACK"
+
+    ADD_SUBMENU_ITEM "menu_set_out" "Host Markers" "t_hm"
+    ADD_SUBMENU_ITEM "menu_set_out" "Chat on Alert" "t_chat"
+    ADD_SUBMENU_ITEM "menu_set_out" "IP Geolocation" "t_ipgeo"
+    ADD_SUBMENU_ITEM "menu_set_out" "$BACK"
+}
+refresh_contacts() {
+    tak_listen; local rc=$? n=0
+    [ -s "$CONTACTS_FILE" ] && n=$(wc -l < "$CONTACTS_FILE")
+    if [ $rc -eq 0 ]; then note "Contacts: ${n// /}"; else info "TAK failed\n${LAST_ERR:-}\nCached: ${n// /}"; fi
+}
+
+cleanup() {   # runs on every exit (Quit or otherwise)
+    vitals_stop
+    step exit
+    # put the LED back the way it was before the payload started (off if unknown)
+    # shellcheck disable=SC2086
+    if [ -n "$SAVED_LED" ]; then LED $SAVED_LED >/dev/null 2>&1 || LED OFF >/dev/null 2>&1; else LED OFF >/dev/null 2>&1; fi
+    [ "$LLDPD_STARTED" = 1 ] && { killall lldpd 2>/dev/null; /etc/init.d/lldpd stop >/dev/null 2>&1; }
+    rm -rf "$RUN"/pkg-* "$RUN"/enroll "$RUN"/connpkg   # logs (*.log) stay in $RUN until reboot
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+SAVED_LED=$(GET_LED 2>/dev/null | head -1)
+case "$SAVED_LED" in *[!A-Za-z0-9\ ]*) SAVED_LED="" ;; esac
+LED SETUP
+mkdir -p "$RUN"
+START_SSH >/dev/null 2>&1       # so you can SSH in while the payload runs
+stage_files
+trim_logs
+step_check
+step "menu"
+trap cleanup EXIT
+load_config
+C_UID=$(device_uid)
+SCREEN_WRITE "SharkTAKDisplay $PAYLOAD_VERSION"
+[ "${MIGRATED:-0}" = 1 ] && SCREEN_WRITE "Moved SharkTAK data"
+[ "${CFG_REPAIRED:-0}" = 1 ] && SCREEN_WRITE "default.cfg cleaned up"
+if [ -n "$LAST_STOP" ]; then
+    SCREEN_WRITE "Last run stopped during:"
+    SCREEN_WRITE "${LAST_STOP:0:40}"
+    SCREEN_WRITE "Power? Results so far are in loot"
+fi
+[ "$(queue_count)" -gt 0 ] && SCREEN_WRITE "Queued: $(queue_count)"
+if [ ! -s "$CERT_DIR/$CLIENT_PEM" ] || [ "$C_HOST" = "takserver.example.com" ]; then
+    SCREEN_WRITE "New here? Settings >"
+    SCREEN_WRITE "Setup Check"
+fi
+initialize_menu
+START_MENU
